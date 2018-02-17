@@ -64,6 +64,8 @@ var (
 	fnlen      int
 	filesizes  = [3]int{128 * 1024, 1024 * 1024, 4 * 1024 * 1024} // 128 KiB, 1MiB, 4 MiB
 	ratios     = [6]float32{0, 0.1, 0.25, 0.5, 0.75, 0.9}         // #gets / #puts
+
+	randombytes = make([]byte, blocksize*16)
 )
 
 // worker's result
@@ -361,12 +363,13 @@ func getRandomFiles(id int, seed int64, numGets int, bucket string, t *testing.T
 	getsGroup.Wait()
 }
 
-func writeRandomData(fname string, bytes []byte, filesize int, random *rand.Rand) (int, error) {
+func writeRandomData(fname string, filesize int, random *rand.Rand) (int, error) {
 	f, err := os.OpenFile(fname, os.O_WRONLY|os.O_CREATE, 0666) //wr-wr-wr-
 	if err != nil {
 		return 0, err
 	}
 	nblocks := filesize / blocksize
+	sblocks := len(randombytes) / blocksize
 	tot := 0
 	var r int
 	for i := 0; i <= nblocks; i++ {
@@ -375,8 +378,9 @@ func writeRandomData(fname string, bytes []byte, filesize int, random *rand.Rand
 		} else {
 			r = filesize - tot
 		}
-		random.Read(bytes[0:r])
-		n, err := f.Write(bytes[0:r])
+		j := random.Intn(sblocks)
+
+		n, err := f.Write(randombytes[j*blocksize : j*blocksize+r])
 		if err != nil {
 			return tot, err
 		} else if n < r {
@@ -387,6 +391,13 @@ func writeRandomData(fname string, bytes []byte, filesize int, random *rand.Rand
 	return tot, f.Close()
 }
 
+func fillRandom(random *rand.Rand) {
+	sblocks := len(randombytes) / blocksize
+	for i := 0; i < sblocks; i++ {
+		random.Read(randombytes[i*blocksize : (i+1)*blocksize])
+	}
+}
+
 func putRandomFiles(id int, seed int64, fileSize uint64, numPuts int, bucket string,
 	t *testing.T, wg *sync.WaitGroup, errch chan error, filesput chan string) {
 	if wg != nil {
@@ -394,10 +405,11 @@ func putRandomFiles(id int, seed int64, fileSize uint64, numPuts int, bucket str
 	}
 	src := rand.NewSource(seed)
 	random := rand.New(src)
-	buffer := make([]byte, blocksize)
+	fillRandom(random)
+
 	for i := 0; i < numPuts; i++ {
 		fname := fastRandomFilename(random)
-		if _, err := writeRandomData(SmokeDir+"/"+fname, buffer, int(fileSize), random); err != nil {
+		if _, err := writeRandomData(SmokeDir+"/"+fname, int(fileSize), random); err != nil {
 			t.Error(err)
 			if errch != nil {
 				errch <- err
