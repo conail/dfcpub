@@ -11,7 +11,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"math/rand"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -20,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/OneOfOne/xxhash"
 	"github.com/golang/glog"
 )
 
@@ -60,18 +63,17 @@ type targetrunner struct {
 	starttime time.Time
 	lbmap     *lbmap
 	rtnamemap *rtnamemap
+	rand      *rand.Rand
 }
 
 // start target runner
 func (t *targetrunner) run() error {
 	// init
 	t.httprunner.init(getstorstats())
-	t.smap = &Smap{}
-	t.xactinp = newxactinp()
-	// local (cache-only) buckets
-	t.lbmap = &lbmap{LBmap: make(map[string]string)}
-	// decongested protected map: in-progress requests; FIXME size
-	t.rtnamemap = newrtnamemap(128)
+	t.smap = &Smap{}                                 // cluster map
+	t.xactinp = newxactinp()                         // extended actions
+	t.lbmap = &lbmap{LBmap: make(map[string]string)} // local (cache-only) buckets
+	t.rtnamemap = newrtnamemap(128)                  // lock/unlock name
 
 	if err := t.register(); err != nil {
 		glog.Errorf("Target %s failed to register with proxy, err: %v", t.si.DaemonID, err)
@@ -131,9 +133,19 @@ func (t *targetrunner) run() error {
 	t.httprunner.registerhdlr("/"+Rversion+"/"+Rdaemon, t.daemonhdlr)
 	t.httprunner.registerhdlr("/"+Rversion+"/"+Rdaemon+"/", t.daemonhdlr) // FIXME
 	t.httprunner.registerhdlr("/", invalhdlr)
+
+	// Register pprof handlers
+	t.httprunner.registerhdlr("/debug/pprof/", pprof.Index)
+	t.httprunner.registerhdlr("/debug/pprof/cmdline", pprof.Cmdline)
+	t.httprunner.registerhdlr("/debug/pprof/profile", pprof.Profile)
+	t.httprunner.registerhdlr("/debug/pprof/symbol", pprof.Symbol)
+	t.httprunner.registerhdlr("/debug/pprof/trace", pprof.Trace)
+
 	glog.Infof("Target %s is ready", t.si.DaemonID)
 	glog.Flush()
 	t.starttime = time.Now()
+	src := rand.NewSource(int64(xxhash.ChecksumString64S(t.si.DaemonID, mLCG32)))
+	t.rand = rand.New(src)
 	return t.httprunner.run()
 }
 
@@ -428,7 +440,7 @@ func (t *targetrunner) doput(w http.ResponseWriter, r *http.Request, bucket stri
 		hdhash  string
 	)
 	fqn := t.fqn(bucket, objname)
-	putfqn := fmt.Sprintf("%s.%d", fqn, time.Now().UnixNano())
+	putfqn := fmt.Sprintf("%s.%d.%d", fqn, time.Now().UnixNano(), t.rand.Intn(100))
 	hdhash = r.Header.Get("Content-HASH")
 	if hdhash == "" {
 		glog.Infof("Warning: empty Content-HASH")
