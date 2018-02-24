@@ -22,13 +22,20 @@ import (
 	"github.com/NVIDIA/dfcpub/dfc"
 )
 
+type Test struct {
+	name   string
+	method func(*testing.T)
+}
+
 const (
-	RestAPIDaemonDelete    = ProxyURL + "/v1/cluster/daemon/"
 	RestAPIClusterPath     = ProxyURL + "/v1/cluster"
 	RestAPIDaemonPath      = ProxyURL + "/v1/daemon"
 	RestAPILocalBucketPath = ProxyURL + "/v1/files/"
 	RestAPIDaemonSuffix    = "/v1/daemon"
 	TestLocalBucketName    = "TESTLOCALBUCKET"
+	RenameLocalBucketName  = "renamebucket"
+	RenameDir              = "/tmp/dfc/rename"
+	RenameStr              = "rename"
 )
 
 var (
@@ -36,8 +43,7 @@ var (
 	GetStatsMsg          = dfc.GetMsg{GetWhat: dfc.GetWhatStats}
 	CreateLocalBucketMsg = dfc.ActionMsg{Action: dfc.ActCreateLB}
 	GetSmapMsg           = dfc.GetMsg{GetWhat: dfc.GetWhatSmap}
-	SyncmapMsg           = dfc.ActionMsg{Action: dfc.ActSyncSmap}
-	RebalanceMsg         = dfc.ActionMsg{Action: dfc.ActionRebalance}
+	RenameMsg            = dfc.ActionMsg{Action: dfc.ActRename}
 	HighWaterMark        = uint32(80)
 	LowWaterMark         = uint32(60)
 	UpdTime              = time.Second * 20
@@ -50,10 +56,17 @@ var (
 		"passthru":        "true",
 		"lru_enabled":     "true",
 	}
-	abortonerr       = true
-	regressionFailed = false
-
-	client = &http.Client{}
+	abortonerr = true
+	client     = &http.Client{}
+	tests      = []Test{
+		Test{"Local Bucket", regressionLocalBuckets},
+		Test{"Cloud Bucket", regressionCloudBuckets},
+		Test{"Stats", regressionStats},
+		Test{"Config", regressionConfig},
+		Test{"Rebalance", regressionRebalance},
+		Test{"LRU", regressionLRU},
+		Test{"Rename", regressionRename},
+	}
 )
 
 func init() {
@@ -62,26 +75,21 @@ func init() {
 
 func Test_regression(t *testing.T) {
 	flag.Parse()
-	fmt.Fprintf(os.Stdout, "=== abortonerr = %v\n\n", abortonerr)
+	tlogf("=== abortonerr = %v\n\n", abortonerr)
 
-	if err := dfc.CreateDir(LocalRootDir); err != nil {
-		t.Fatalf("Failed to create dir %s, err: %v", LocalRootDir, err)
+	if err := dfc.CreateDir(LocalDestDir); err != nil {
+		t.Fatalf("Failed to create dir %s, err: %v", LocalDestDir, err)
 	}
 	if err := dfc.CreateDir(SmokeDir); err != nil {
 		t.Fatalf("Failed to create dir %s, err: %v", SmokeDir, err)
 	}
 
-	t.Run("Local Buckets", regressionLocalBuckets)
-	t.Run("Cloud Bucket", regressionCloudBuckets)
-	t.Run("Stats", regressionStats)
-	t.Run("Config", regressionConfig)
-	t.Run("Sync&Rebalance", regressionSyncRebalance)
-	t.Run("LRU", regressionLRU)
-}
-
-func regressionSyncRebalance(t *testing.T) {
-	syncSmaps(client, t)
-	rebalanceCluster(client, t)
+	for _, test := range tests {
+		t.Run(test.name, test.method)
+		if t.Failed() && abortonerr {
+			t.FailNow()
+		}
+	}
 }
 
 func regressionCloudBuckets(t *testing.T) {
@@ -94,23 +102,20 @@ func regressionLocalBuckets(t *testing.T) {
 	time.Sleep(time.Second * 2) // FIXME: must be deterministic
 	regressionBucket(client, t, bucket)
 	destroyLocalBucket(client, t, bucket)
-	if abortonerr && t.Failed() {
-		regressionFailed = true
-	}
 }
 
 func regressionBucket(client *http.Client, t *testing.T, bucket string) {
 	var (
-		filesput = make(chan string, 10)
+		numPuts  = 10
+		filesput = make(chan string, numPuts)
 		errch    = make(chan error, 100)
 		wg       = &sync.WaitGroup{}
-		numPuts  = 10
 	)
-	putRandomFiles(0, 0, uint64(1024), numPuts, bucket, t, nil, errch, filesput)
+	putRandomFiles(0, baseseed+2, uint64(1024), numPuts, bucket, t, nil, errch, filesput, SmokeDir, smokestr)
 	close(filesput) // to exit for-range
-	selectErr(errch, "put", t)
+	selectErr(errch, "put", t, false)
 	getRandomFiles(0, 0, numPuts, bucket, t, nil, errch)
-	selectErr(errch, "get", t)
+	selectErr(errch, "get", t, false)
 	for fname := range filesput {
 		err := os.Remove(SmokeDir + "/" + fname)
 		if err != nil {
@@ -120,11 +125,8 @@ func regressionBucket(client *http.Client, t *testing.T, bucket string) {
 		go del(bucket, "smoke/"+fname, wg, errch)
 	}
 	wg.Wait()
-	selectErr(errch, "delete", t)
+	selectErr(errch, "delete", t, abortonerr)
 	close(errch)
-	if abortonerr && t.Failed() {
-		regressionFailed = true
-	}
 }
 
 func regressionStats(t *testing.T) {
@@ -158,9 +160,6 @@ func regressionStats(t *testing.T) {
 				t.Error("Used Percentage above High Watermark")
 			}
 		}
-	}
-	if abortonerr && t.Failed() {
-		regressionFailed = true
 	}
 }
 
@@ -236,10 +235,6 @@ func regressionConfig(t *testing.T) {
 		o := olruconfig["lru_enabled"].(bool)
 		setConfig("lru_enabled", strconv.FormatBool(o), RestAPIClusterPath, client, t)
 	}
-
-	if abortonerr && t.Failed() {
-		regressionFailed = true
-	}
 }
 
 func regressionLRU(t *testing.T) {
@@ -265,10 +260,7 @@ func regressionLRU(t *testing.T) {
 	// add some files
 	//
 	getRandomFiles(0, 0, 20, clibucket, t, nil, errch)
-	selectErr(errch, "get", t)
-	if t.Failed() {
-		return
-	}
+	selectErr(errch, "get", t, true)
 	//
 	// find out min usage %% across all targets
 	//
@@ -279,13 +271,13 @@ func regressionLRU(t *testing.T) {
 			usedpct = min(usedpct, c.Usedpct)
 		}
 	}
-	fmt.Fprintf(os.Stdout, "LRU: current min space usage in the cluster: %d%%\n", usedpct)
+	tlogf("LRU: current min space usage in the cluster: %d%%\n", usedpct)
 	var (
 		lowwm  = usedpct - 5
 		highwm = usedpct - 1
 	)
 	if int(lowwm) < 10 {
-		t.Errorf("The current space usage is too low (%d) for the LRU to be tested", lowwm)
+		t.Skipf("The current space usage is too low (%d) for the LRU to be tested", lowwm)
 		return
 	}
 	oconfig := getConfig(RestAPIDaemonPath, client, t)
@@ -300,8 +292,6 @@ func regressionLRU(t *testing.T) {
 		setConfig("dont_evict_time", olruconfig["dont_evict_time"].(string), RestAPIClusterPath, client, t)
 		setConfig("highwm", fmt.Sprint(olruconfig["highwm"]), RestAPIClusterPath, client, t)
 		setConfig("lowwm", fmt.Sprint(olruconfig["lowwm"]), RestAPIClusterPath, client, t)
-	}()
-	defer func() {
 		for k, di := range smap.Smap {
 			setConfig("highwm", fmt.Sprint(hwms[k]), di.DirectURL+RestAPIDaemonSuffix, client, t)
 			setConfig("lowwm", fmt.Sprint(lwms[k]), di.DirectURL+RestAPIDaemonSuffix, client, t)
@@ -337,7 +327,7 @@ func regressionLRU(t *testing.T) {
 	test_fspaths := oconfig["test_fspaths"].(map[string]interface{})
 	for k, v := range stats.Target {
 		bytes := v.Core.Bytesevicted - bytesEvictedOrig[k]
-		fmt.Fprintf(os.Stdout, "Target %s: evicted %d files - %.2f MB (%dB) total\n",
+		tlogf("Target %s: evicted %d files - %.2f MB (%dB) total\n",
 			k, v.Core.Filesevicted-filesEvictedOrig[k], float64(bytes)/1000/1000, bytes)
 		//
 		// testingFSPpaths() - cannot reliably verify space utilization by tmpfs
@@ -353,78 +343,233 @@ func regressionLRU(t *testing.T) {
 	}
 }
 
+func regressionRebalance(t *testing.T) {
+	var (
+		sid      string
+		numPuts  = 30
+		filesput = make(chan string, numPuts)
+		errch    = make(chan error, 100)
+		wg       = &sync.WaitGroup{}
+	)
+	filesSentOrig := make(map[string]int64)
+	bytesSentOrig := make(map[string]int64)
+	filesRecvOrig := make(map[string]int64)
+	bytesRecvOrig := make(map[string]int64)
+	stats := getClusterStats(client, t)
+	for k, v := range stats.Target {
+		bytesSentOrig[k], filesSentOrig[k], bytesRecvOrig[k], filesRecvOrig[k] =
+			v.Core.Numsentbytes, v.Core.Numsentfiles, v.Core.Numrecvbytes, v.Core.Numrecvfiles
+	}
+	//
+	// step 1. unregister random target
+	//
+	smap := getClusterMap(client, t)
+	l := len(smap.Smap)
+	if l < 2 {
+		if l == 0 {
+			t.Fatal("DFC cluster is empty - zero targets")
+		} else {
+			t.Fatalf("Must have 2 or more targets in the cluster, have only %d", l)
+		}
+	}
+	for sid = range smap.Smap {
+		break
+	}
+	unregisterTarget(sid, t)
+	tlogf("Unregistered %s: cluster size = %d (targets)\n", sid, l-1)
+	//
+	// step 2. put random files => (cluster - 1)
+	//
+	putRandomFiles(0, baseseed, uint64(1024*128), numPuts, clibucket, t, nil, errch, filesput, SmokeDir, smokestr)
+	selectErr(errch, "put", t, false)
+
+	//
+	// step 3. register back
+	//
+	registerTarget(sid, &smap, t)
+	for i := 0; i < 10; i++ {
+		time.Sleep(time.Second)
+		smap = getClusterMap(client, t)
+		if len(smap.Smap) == l {
+			break
+		}
+	}
+	if len(smap.Smap) != l {
+		t.Errorf("Re-registration timed out: target %s, original num targets %d\n", sid, l)
+		return
+	}
+	tlogf("Re-registered %s: the cluster is now back to %d targets\n", sid, l)
+	//
+	// step 4. wait for rebalance to run its course
+	//
+	waitProgressBar("Rebalance: ", time.Second*10)
+	//
+	// step 5. statistics
+	//
+	stats = getClusterStats(client, t)
+	var bsent, fsent, brecv, frecv int64
+	for k, v := range stats.Target {
+		bsent += v.Core.Numsentbytes - bytesSentOrig[k]
+		fsent += v.Core.Numsentfiles - filesSentOrig[k]
+		brecv += v.Core.Numrecvbytes - bytesRecvOrig[k]
+		frecv += v.Core.Numrecvfiles - filesRecvOrig[k]
+	}
+
+	//
+	// step 6. cleanup
+	//
+	close(filesput) // to exit for-range
+	for fname := range filesput {
+		err := os.Remove(SmokeDir + "/" + fname)
+		if err != nil {
+			t.Error(err)
+		}
+		wg.Add(1)
+		go del(clibucket, "smoke/"+fname, wg, errch)
+	}
+	wg.Wait()
+	selectErr(errch, "delete", t, abortonerr)
+	close(errch)
+	if !t.Failed() && testing.Verbose() {
+		fmt.Printf("Rebalance: sent     %.2f MB in %d files\n", float64(bsent)/1000/1000, fsent)
+		fmt.Printf("           received %.2f MB in %d files\n", float64(brecv)/1000/1000, frecv)
+	}
+}
+
+func regressionRename(t *testing.T) {
+	var (
+		req       *http.Request
+		r         *http.Response
+		injson    []byte
+		err       error
+		numPuts   = 10
+		filesput  = make(chan string, numPuts)
+		errch     = make(chan error, numPuts)
+		basenames = make([]string, 0, numPuts) // basenames generated by putRandomFiles
+		bnewnames = make([]string, 0, numPuts) // new basenames
+	)
+	// create & put
+	createLocalBucket(client, t, RenameLocalBucketName)
+	defer func() {
+		// cleanup
+		wg := &sync.WaitGroup{}
+		for _, fname := range bnewnames {
+			wg.Add(1)
+			go del(RenameLocalBucketName, RenameStr+"/"+fname, wg, errch)
+		}
+		for _, fname := range basenames {
+			err = os.Remove(RenameDir + "/" + fname)
+			if err != nil {
+				t.Errorf("Failed to remove file %s: %v", fname, err)
+			}
+		}
+		wg.Wait()
+		selectErr(errch, "delete", t, false)
+		close(errch)
+		destroyLocalBucket(client, t, RenameLocalBucketName)
+	}()
+
+	time.Sleep(time.Second * 5)
+
+	if err = dfc.CreateDir(RenameDir); err != nil {
+		t.Errorf("Error creating dir: %v", err)
+	}
+	putRandomFiles(0, baseseed+1, 0, numPuts, RenameLocalBucketName, t, nil, nil, filesput, RenameDir, RenameStr)
+	selectErr(errch, "put", t, false)
+	close(filesput)
+	for fname := range filesput {
+		basenames = append(basenames, fname)
+	}
+
+	// rename
+	for _, fname := range basenames {
+		RenameMsg.Name = RenameStr + "/" + fname + ".renamed" // objname
+		bnewnames = append(bnewnames, fname+".renamed")       // base name
+		injson, err = json.Marshal(RenameMsg)
+		if err != nil {
+			t.Fatalf("Failed to marshal RenameMsg: %v", err)
+		}
+		req, err = http.NewRequest("POST", RestAPILocalBucketPath+RenameLocalBucketName+"/"+RenameStr+"/"+fname, bytes.NewBuffer(injson))
+		if err != nil {
+			t.Fatalf("Failed to create request: %v", err)
+		}
+		r, err = client.Do(req)
+		if r != nil {
+			r.Body.Close()
+		}
+		s := fmt.Sprintf("Rename %s/%s => %s", RenameStr, fname, RenameMsg.Name)
+		if testfail(err, s, r, nil, t) {
+			destroyLocalBucket(client, t, RenameLocalBucketName)
+			return
+		}
+		tlogln(s)
+	}
+
+	// get renamed objects
+	waitProgressBar("Rename/move: ", time.Second*5)
+	for _, fname := range bnewnames {
+		get(RenameStr+"/"+fname, nil, errch, RenameLocalBucketName)
+	}
+	selectErr(errch, "get", t, false)
+}
+
 // helper (likely to be used)
 func waitProgressBar(prefix string, wait time.Duration) {
 	ticker := time.NewTicker(time.Second * 5)
-	fmt.Fprintf(os.Stdout, prefix)
+	tlogf(prefix)
+	idx := 1
 waitloop:
-	for i := 1; ; i++ {
-		select {
-		case <-ticker.C:
-			if regressionFailed {
-				return
-			}
-			elapsed := time.Second * 2 * time.Duration(i)
-			if elapsed >= wait {
-				fmt.Fprintf(os.Stdout, "\n")
-				break waitloop
-			}
-			fmt.Fprintf(os.Stdout, "----%d%%", (elapsed * 100 / wait))
+	for range ticker.C {
+		elapsed := time.Second * 2 * time.Duration(idx)
+		if elapsed >= wait {
+			tlogln("")
+			break waitloop
 		}
+		tlogf("----%d%%", (elapsed * 100 / wait))
+		idx++
 	}
 }
 
-func syncSmaps(client *http.Client, t *testing.T) {
+func unregisterTarget(sid string, t *testing.T) {
 	var (
-		req    *http.Request
-		r      *http.Response
-		injson []byte
-		err    error
+		req *http.Request
+		r   *http.Response
+		err error
 	)
-	injson, err = json.Marshal(SyncmapMsg)
-	if err != nil {
-		t.Fatalf("Failed to marshal SyncmapMsg: %v", err)
-	}
-	req, err = http.NewRequest("PUT", RestAPIClusterPath, bytes.NewBuffer(injson))
+	req, err = http.NewRequest("DELETE", RestAPIClusterPath+"/"+"daemon"+"/"+sid, nil)
 	if err != nil {
 		t.Fatalf("Failed to create request: %v", err)
 	}
 	r, err = client.Do(req)
-	defer func() {
-		if r != nil {
-			r.Body.Close()
-		}
-	}()
-	if testfail(err, fmt.Sprintf("Synchronize Smaps"), r, nil, t) {
+	if r != nil {
+		r.Body.Close()
+	}
+	if testfail(err, fmt.Sprintf("Unregister target %s", sid), r, nil, t) {
 		return
 	}
+	time.Sleep(time.Second * 3)
 }
 
-func rebalanceCluster(client *http.Client, t *testing.T) {
+func registerTarget(sid string, smap *dfc.Smap, t *testing.T) {
 	var (
-		req    *http.Request
-		r      *http.Response
-		injson []byte
-		err    error
+		req *http.Request
+		r   *http.Response
+		err error
 	)
-	injson, err = json.Marshal(RebalanceMsg)
-	if err != nil {
-		t.Fatalf("Failed to marshal RebalanceMsg: %v", err)
-	}
-	req, err = http.NewRequest("PUT", RestAPIClusterPath, bytes.NewBuffer(injson))
+	si := smap.Smap[sid]
+	req, err = http.NewRequest("POST", si.DirectURL+"/v1/daemon", nil)
 	if err != nil {
 		t.Fatalf("Failed to create request: %v", err)
 	}
 	r, err = client.Do(req)
-	defer func() {
-		if r != nil {
-			r.Body.Close()
-		}
-	}()
-	if testfail(err, fmt.Sprintf("Initiate Rebalance"), r, nil, t) {
+	if r != nil {
+		r.Body.Close()
+	}
+	if t.Failed() || testfail(err, fmt.Sprintf("Register target %s", sid), r, nil, t) {
 		return
 	}
 }
+
 func createLocalBucket(client *http.Client, t *testing.T, bucket string) {
 	var (
 		req    *http.Request
@@ -446,7 +591,7 @@ func createLocalBucket(client *http.Client, t *testing.T, bucket string) {
 			r.Body.Close()
 		}
 	}()
-	if testfail(err, fmt.Sprintf("Create Local Bucket"), r, nil, t) {
+	if testfail(err, "Create Local Bucket", r, nil, t) {
 		return
 	}
 }
@@ -467,7 +612,7 @@ func destroyLocalBucket(client *http.Client, t *testing.T, bucket string) {
 			r.Body.Close()
 		}
 	}()
-	if testfail(err, fmt.Sprintf("Delete Local Bucket"), r, nil, t) {
+	if testfail(err, "Delete Local Bucket", r, nil, t) {
 		return
 	}
 }
@@ -493,7 +638,7 @@ func getClusterStats(client *http.Client, t *testing.T) (stats dfc.ClusterStats)
 			r.Body.Close()
 		}
 	}()
-	if testfail(err, fmt.Sprintf("Get configuration"), r, nil, t) {
+	if testfail(err, "Get configuration", r, nil, t) {
 		return
 	}
 	var b []byte
@@ -529,7 +674,7 @@ func getDaemonStats(client *http.Client, t *testing.T, URL string) (stats map[st
 			r.Body.Close()
 		}
 	}()
-	if testfail(err, fmt.Sprintf("Get configuration"), r, nil, t) {
+	if testfail(err, "Get configuration", r, nil, t) {
 		return
 	}
 	var b []byte
@@ -568,7 +713,7 @@ func getClusterMap(client *http.Client, t *testing.T) (smap dfc.Smap) {
 			r.Body.Close()
 		}
 	}()
-	if testfail(err, fmt.Sprintf("Get configuration"), r, nil, t) {
+	if testfail(err, "Get configuration", r, nil, t) {
 		return
 	}
 	var b []byte
@@ -604,7 +749,7 @@ func getConfig(URL string, client *http.Client, t *testing.T) (dfcfg map[string]
 			r.Body.Close()
 		}
 	}()
-	if testfail(err, fmt.Sprintf("Get configuration"), r, nil, t) {
+	if testfail(err, "Get configuration", r, nil, t) {
 		return
 	}
 
@@ -614,13 +759,11 @@ func getConfig(URL string, client *http.Client, t *testing.T) (dfcfg map[string]
 		t.Errorf("Failed to read response body")
 		return
 	}
-
 	err = json.Unmarshal(b, &dfcfg)
 	if err != nil {
-		t.Errorf("Failed to unmarshal Dfconfig: %v", err)
+		t.Errorf("Failed to unmarshal config: %v", err)
 		return
 	}
-
 	return
 }
 func setConfig(name, value, URL string, client *http.Client, t *testing.T) {
@@ -634,7 +777,6 @@ func setConfig(name, value, URL string, client *http.Client, t *testing.T) {
 		t.Errorf("Failed to marshal SetConfig Message: %v", err)
 		return
 	}
-
 	req, err := http.NewRequest("PUT", URL, bytes.NewBuffer(injson))
 	if err != nil {
 		t.Errorf("Failed to create request: %v", err)
@@ -650,7 +792,6 @@ func setConfig(name, value, URL string, client *http.Client, t *testing.T) {
 		t.Errorf("Failed to execute SetConfig request: %v", err)
 		return
 	}
-
 }
 
 func min(a, b uint32) uint32 {
@@ -660,14 +801,24 @@ func min(a, b uint32) uint32 {
 	return b
 }
 
-func selectErr(errch chan error, verb string, t *testing.T) {
+func selectErr(errch chan error, verb string, t *testing.T, errisfatal bool) {
 	select {
 	case err := <-errch:
-		if abortonerr {
+		if errisfatal {
 			t.Fatalf("Failed to %s files: %v", verb, err)
 		} else {
 			t.Errorf("Failed to %s files: %v", verb, err)
 		}
 	default:
 	}
+}
+
+func tlogf(msg string, args ...interface{}) {
+	if testing.Verbose() {
+		fmt.Fprintf(os.Stdout, msg, args...)
+	}
+}
+
+func tlogln(msg string) {
+	tlogf(msg + "\n")
 }

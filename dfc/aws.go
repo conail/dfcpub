@@ -15,18 +15,24 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/golang/glog"
 )
 
+const (
+	AWS_MULTI_PART_DELIMITER = "-"
+)
+
 //======
 //
-// types
+// implements cloudif
 //
 //======
-type awsif struct {
+type awsimpl struct {
+	t *targetrunner
 }
 
 //======
@@ -41,12 +47,20 @@ func createsession() *session.Session {
 
 }
 
+func awsErrorToHTTP(awsError error) int {
+	if reqErr, ok := awsError.(awserr.RequestFailure); ok {
+		return reqErr.StatusCode()
+	}
+
+	return http.StatusInternalServerError
+}
+
 //======
 //
 // methods
 //
 //======
-func (cloudif *awsif) listbucket(w http.ResponseWriter, bucket string, msg *GetMsg) (errstr string) {
+func (awsimpl *awsimpl) listbucket(bucket string, msg *GetMsg) (jsbytes []byte, errstr string, errcode int) {
 	glog.Infof("aws listbucket %s", bucket)
 	sess := createsession()
 	svc := s3.New(sess)
@@ -54,6 +68,7 @@ func (cloudif *awsif) listbucket(w http.ResponseWriter, bucket string, msg *GetM
 	resp, err := svc.ListObjects(params)
 	if err != nil {
 		errstr = err.Error()
+		errcode = awsErrorToHTTP(err)
 		return
 	}
 	// var msg GetMsg
@@ -85,18 +100,13 @@ func (cloudif *awsif) listbucket(w http.ResponseWriter, bucket string, msg *GetM
 	if glog.V(3) {
 		glog.Infof("listbucket count %d", len(reslist.Entries))
 	}
-	jsbytes, err := json.Marshal(reslist)
+	jsbytes, err = json.Marshal(reslist)
 	assert(err == nil, err)
-	w.Header().Set("Content-Type", "application/json")
-	w.Write(jsbytes)
 	return
 }
 
-func (cloudif *awsif) getobj(fqn, bucket, objname string) (md5hash string, errstr string) {
-	var (
-		size int64
-		omd5 string
-	)
+func (awsimpl *awsimpl) getobj(fqn, bucket, objname string) (md5hash string, size int64, errstr string, errcode int) {
+	var omd5 string
 	sess := createsession()
 	s3Svc := s3.New(sess)
 	obj, err := s3Svc.GetObject(&s3.GetObjectInput{
@@ -104,14 +114,24 @@ func (cloudif *awsif) getobj(fqn, bucket, objname string) (md5hash string, errst
 		Key:    aws.String(objname),
 	})
 	if err != nil {
-		return "", fmt.Sprintf("aws: Failed to get %s from bucket %s, err: %v", objname, bucket, err)
+		errcode = awsErrorToHTTP(err)
+		errstr = fmt.Sprintf("aws: Failed to get %s from bucket %s, err: %v", objname, bucket, err)
+		return
 	}
 	defer obj.Body.Close()
 
-	// the object is multipart?
 	omd5, _ = strconv.Unquote(*obj.ETag)
-	if size, md5hash, errstr = ReceiveFileAndFinalize(fqn, objname, omd5, obj.Body); errstr != "" {
-		return "", errstr
+	// Check for MultiPart
+	if strings.Contains(omd5, AWS_MULTI_PART_DELIMITER) {
+		if glog.V(3) {
+			glog.Infof("MultiPart object (bucket %s key %s) download and validation not supported",
+				bucket, objname)
+		}
+		// Ignore ETag
+		omd5 = ""
+	}
+	if md5hash, size, errstr = awsimpl.t.receiveFileAndFinalize(fqn, objname, omd5, obj.Body); errstr != "" {
+		return
 	}
 	stats := getstorstats()
 	stats.add("bytesloaded", size)
@@ -122,15 +142,19 @@ func (cloudif *awsif) getobj(fqn, bucket, objname string) (md5hash string, errst
 
 }
 
-func (cloudif *awsif) putobj(file *os.File, bucket, objname string) (errstr string) {
+func (awsimpl *awsimpl) putobj(file *os.File, bucket, objname string) (errstr string, errcode int) {
 	sess := createsession()
 	uploader := s3manager.NewUploader(sess)
+	//
+	// FIXME: use uploader.UploadWithContext() for larger files
+	//
 	_, err := uploader.Upload(&s3manager.UploadInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(objname),
 		Body:   file,
 	})
 	if err != nil {
+		errcode = awsErrorToHTTP(err)
 		errstr = fmt.Sprintf("aws: Failed to put %s (bucket %s), err: %v", objname, bucket, err)
 		return
 	}
@@ -139,11 +163,13 @@ func (cloudif *awsif) putobj(file *os.File, bucket, objname string) (errstr stri
 	}
 	return
 }
-func (cloudif *awsif) deleteobj(bucket, objname string) (errstr string) {
+
+func (awsimpl *awsimpl) deleteobj(bucket, objname string) (errstr string, errcode int) {
 	sess := createsession()
 	svc := s3.New(sess)
 	_, err := svc.DeleteObject(&s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String(objname)})
 	if err != nil {
+		errcode = awsErrorToHTTP(err)
 		errstr = fmt.Sprintf("aws: Failed to delete %s (bucket %s), err: %v", objname, bucket, err)
 		return
 	}

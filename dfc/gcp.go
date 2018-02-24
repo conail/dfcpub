@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -16,15 +17,17 @@ import (
 	"cloud.google.com/go/storage"
 	"github.com/golang/glog"
 	"golang.org/x/net/context"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 )
 
 //======
 //
-// types
+// implements cloudif
 //
 //======
-type gcpif struct {
+type gcpimpl struct {
+	t *targetrunner
 }
 
 //======
@@ -36,12 +39,20 @@ func getProjID() string {
 	return os.Getenv("GOOGLE_CLOUD_PROJECT")
 }
 
+func gcpErrorToHTTP(gcpError error) int {
+	if gcperror, ok := gcpError.(*googleapi.Error); ok {
+		return gcperror.Code
+	}
+
+	return http.StatusInternalServerError
+}
+
 //======
 //
 // methods
 //
 //======
-func (cloudif *gcpif) listbucket(w http.ResponseWriter, bucket string, msg *GetMsg) (errstr string) {
+func (gcpimpl *gcpimpl) listbucket(bucket string, msg *GetMsg) (jsbytes []byte, errstr string, errcode int) {
 	glog.Infof("gcp listbucket %s", bucket)
 	client, gctx, errstr := createclient()
 	if errstr != "" {
@@ -54,6 +65,10 @@ func (cloudif *gcpif) listbucket(w http.ResponseWriter, bucket string, msg *GetM
 		attrs, err := it.Next()
 		if err == iterator.Done {
 			break
+		}
+		if err != nil {
+			errcode = gcpErrorToHTTP(err)
+			errstr = fmt.Sprintf("gcp: Failed to list objects of bucket %s, err: %v", bucket, err)
 		}
 		entry := &BucketEntry{}
 		entry.Name = attrs.Name
@@ -86,8 +101,6 @@ func (cloudif *gcpif) listbucket(w http.ResponseWriter, bucket string, msg *GetM
 	}
 	jsbytes, err := json.Marshal(reslist)
 	assert(err == nil, err)
-	w.Header().Set("Content-Type", "application/json")
-	w.Write(jsbytes)
 	return
 }
 
@@ -105,10 +118,7 @@ func createclient() (*storage.Client, context.Context, string) {
 }
 
 // FIXME: revisit error processing
-func (cloudif *gcpif) getobj(fqn string, bucket string, objname string) (md5hash string, errstr string) {
-	var (
-		size int64
-	)
+func (gcpimpl *gcpimpl) getobj(fqn string, bucket string, objname string) (md5hash string, size int64, errstr string, errcode int) {
 	client, gctx, errstr := createclient()
 	if errstr != "" {
 		return
@@ -116,19 +126,19 @@ func (cloudif *gcpif) getobj(fqn string, bucket string, objname string) (md5hash
 	o := client.Bucket(bucket).Object(objname)
 	attrs, err := o.Attrs(gctx)
 	if err != nil {
-		return "", fmt.Sprintf("gcp: Failed to get attributes (object %s, bucket %s), err: %v",
-			objname, bucket, err)
+		errcode = gcpErrorToHTTP(err)
+		errstr = fmt.Sprintf("gcp: Failed to get attributes (object %s, bucket %s), err: %v", objname, bucket, err)
+		return
 	}
 	omd5 := hex.EncodeToString(attrs.MD5)
-
 	rc, err := o.NewReader(gctx)
 	if err != nil {
-		return "", fmt.Sprintf("gcp: Failed to create rc (object %s, bucket %s), err: %v",
-			objname, bucket, err)
+		errstr = fmt.Sprintf("gcp: Failed to create rc (object %s, bucket %s), err: %v", objname, bucket, err)
+		return
 	}
 	defer rc.Close()
-	if size, md5hash, errstr = ReceiveFileAndFinalize(fqn, objname, omd5, rc); errstr != "" {
-		return "", errstr
+	if md5hash, size, errstr = gcpimpl.t.receiveFileAndFinalize(fqn, objname, omd5, rc); errstr != "" {
+		return
 	}
 	stats := getstorstats()
 	stats.add("bytesloaded", size)
@@ -138,13 +148,15 @@ func (cloudif *gcpif) getobj(fqn string, bucket string, objname string) (md5hash
 	return
 }
 
-func (cloudif *gcpif) putobj(file *os.File, bucket, objname string) (errstr string) {
+func (gcpimpl *gcpimpl) putobj(file *os.File, bucket, objname string) (errstr string, errcode int) {
 	client, gctx, errstr := createclient()
 	if errstr != "" {
 		return
 	}
 	wc := client.Bucket(bucket).Object(objname).NewWriter(gctx)
-	_, err := copyBuffer(wc, file)
+	buf := gcpimpl.t.buffers.alloc()
+	defer gcpimpl.t.buffers.free(buf)
+	written, err := io.CopyBuffer(wc, file, buf)
 	if err != nil {
 		errstr = fmt.Sprintf("gcp: Failed to copy-buffer (object %s, bucket %s), err: %v", objname, bucket, err)
 		return
@@ -155,12 +167,12 @@ func (cloudif *gcpif) putobj(file *os.File, bucket, objname string) (errstr stri
 		return
 	}
 	if glog.V(3) {
-		glog.Infof("gcp: PUT %s (bucket %s) ", objname, bucket)
+		glog.Infof("gcp: PUT %s (bucket %s, size %d) ", objname, bucket, written)
 	}
 	return
 }
 
-func (cloudif *gcpif) deleteobj(bucket, objname string) (errstr string) {
+func (gcpimpl *gcpimpl) deleteobj(bucket, objname string) (errstr string, errcode int) {
 	client, gctx, errstr := createclient()
 	if errstr != "" {
 		return
@@ -168,6 +180,7 @@ func (cloudif *gcpif) deleteobj(bucket, objname string) (errstr string) {
 	o := client.Bucket(bucket).Object(objname)
 	err := o.Delete(gctx)
 	if err != nil {
+		errcode = gcpErrorToHTTP(err)
 		errstr = fmt.Sprintf("gcp: Failed to delete %s (bucket %s), err: %v", objname, bucket, err)
 		return
 	}

@@ -34,6 +34,7 @@ type lructx struct {
 	newest  time.Time
 	xlru    *xactLRU
 	h       *maxheap
+	t       *targetrunner
 }
 
 // FIXME: mountpath.enabled is never used
@@ -73,19 +74,19 @@ func (t *targetrunner) runLRU() {
 }
 
 // TODO: local-buckets-first LRU policy
-func (t *targetrunner) oneLRU(bucketdir string, fschkwg *sync.WaitGroup, xlru *xactLRU) error {
+func (t *targetrunner) oneLRU(bucketdir string, fschkwg *sync.WaitGroup, xlru *xactLRU) {
 	defer fschkwg.Done()
 	h := &maxheap{}
 	heap.Init(h)
 
 	toevict, err := get_toevict(bucketdir, ctx.config.LRUConfig.HighWM, ctx.config.LRUConfig.LowWM)
 	if err != nil {
-		return err
+		return
 	}
 	glog.Infof("LRU %s: to evict %.2f MB", bucketdir, float64(toevict)/1000/1000)
 
 	// init LRU context
-	lctx := &lructx{totsize: toevict, xlru: xlru, h: h}
+	lctx := &lructx{totsize: toevict, xlru: xlru, h: h, t: t}
 
 	if err = filepath.Walk(bucketdir, lctx.lruwalkfn); err != nil {
 		s := err.Error()
@@ -94,14 +95,11 @@ func (t *targetrunner) oneLRU(bucketdir string, fschkwg *sync.WaitGroup, xlru *x
 		} else {
 			glog.Errorf("Failed to traverse %q, err: %v", bucketdir, err)
 		}
-		return err
+		return
 	}
-
 	if err := t.doLRU(toevict, bucketdir, lctx); err != nil {
 		glog.Errorf("doLRU %q, err: %v", bucketdir, err)
-		return err
 	}
-	return nil
 }
 
 // the walking callback is execited by the LRU xaction
@@ -149,22 +147,6 @@ func (lctx *lructx) lruwalkfn(fqn string, osfi os.FileInfo, err error) error {
 		}
 		return nil
 	}
-	// remove invalid object files.
-	if isinvalidobj(fqn) {
-		//
-		// FIXME: temp patch to prevent setconfig(1s) --> PUT/LRU scenario
-		//
-		dontevictimeInvalid := now.Add(-time.Minute * 30)
-		if usetime.Before(dontevictimeInvalid) {
-			err = osRemove("lru-invalid", fqn)
-			if err != nil {
-				glog.Errorf("LRU: failed to delete invalid %s, err: %v", fqn, err)
-			} else if glog.V(3) {
-				glog.Infof("LRU: removed invalid %s", fqn)
-			}
-			return nil
-		}
-	}
 	// partial optimization:
 	// 	do nothing if the heap's cursize >= totsize &&
 	// 	the file is more recent then the the heap's newest
@@ -196,7 +178,7 @@ func (t *targetrunner) doLRU(toevict int64, bucketdir string, lctx *lructx) erro
 	)
 	for h.Len() > 0 && toevict > 10 {
 		fi := heap.Pop(h).(*fileinfo)
-		if err := t.osRemove(fi.fqn); err != nil {
+		if err := t.lrufilRemove("lru", fi.fqn); err != nil {
 			glog.Errorf("Failed to evict %q, err: %v", fi.fqn, err)
 			continue
 		}
@@ -215,7 +197,7 @@ func (t *targetrunner) doLRU(toevict int64, bucketdir string, lctx *lructx) erro
 	return nil
 }
 
-func (t *targetrunner) osRemove(fqn string) error {
+func (t *targetrunner) lrufilRemove(prefix, fqn string) error {
 	bucket, objname, ok := t.fqn2bckobj(fqn)
 	if !ok {
 		glog.Errorf("Cannot convert (%q => bucket %s, object %s) - fspath config changed?", fqn, bucket, objname)
@@ -223,7 +205,7 @@ func (t *targetrunner) osRemove(fqn string) error {
 		if err := os.Remove(fqn); err != nil {
 			return err
 		}
-		glog.Infof("lru: removed %q", fqn)
+		glog.Infof("%s: removed %q", prefix, fqn)
 		return nil
 	}
 	uname := bucket + objname

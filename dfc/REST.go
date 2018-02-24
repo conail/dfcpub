@@ -12,20 +12,20 @@ type ActionMsg struct {
 	Action string `json:"action"` // shutdown, restart, setconfig - the enum below
 	Name   string `json:"name"`   // action-specific params
 	Value  string `json:"value"`
-	Param1 string `json:"param1"`
-	Param2 string `json:"param2"`
 }
 
 // ActionMsg.Action enum
 const (
 	ActShutdown     = "shutdown"
 	ActSyncSmap     = "syncsmap"  // synchronize cluster map aka Smap across all targets
-	ActionRebalance = "rebalance" // rebalance local caches upon target(s) joining and/or leaving the cluster
+	ActRebalance = "rebalance" // rebalance local caches upon target(s) joining and/or leaving the cluster
 	ActLRU          = "lru"
 	ActSyncLB       = "synclb"
 	ActCreateLB     = "createlb"
 	ActDestroyLB    = "destroylb"
 	ActSetConfig    = "setconfig"
+	ActRename       = "rename"
+	ActEvict        = "evict"
 )
 
 // TODO: sort and some props are TBD
@@ -105,7 +105,7 @@ const (
 	Rcluster  = "cluster"
 	Rdaemon   = "daemon"
 	Rsyncsmap = ActSyncSmap
-	Rebalance = ActionRebalance
+	Rebalance = ActRebalance
 	Rfrom     = "from_id"
 	Rto       = "to_id"
 	Rsynclb   = ActSyncLB

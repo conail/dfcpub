@@ -40,6 +40,7 @@ LOWWATERMARK=75
 HIGHWATERMARK=90
 NOXATTRS=false
 LRUENABLED=true
+VALIDATECOLDGET=true
 
 PROXYPORT=$(expr $PORT + 1)
 if lsof -Pi :$PROXYPORT -sTCP:LISTEN -t >/dev/null; then
@@ -78,7 +79,7 @@ fi
 START=0
 END=$servcount
 
-echo Test-only: enter number of local cache directories for each target:
+echo "Number of local cache directories (enter 0 to use preconfigured filesystems):"
 read testfspathcnt
 if ! [[ "$testfspathcnt" =~ ^[0-9]+$ ]] ; then
 	echo "Error: '$testfspathcnt' is not a number"; exit 1
@@ -130,6 +131,9 @@ do
 		"maxconcurrupld":	${MAXCONCURRENTUPLOAD},
 		"maxpartsize":		${MAXPARTSIZE}
 	},
+	"cksum_config": {
+                 "validate_cold_get":             ${VALIDATECOLDGET}
+	},
 	"lru_config": {
 		"lowwm":		${LOWWATERMARK},
 		"highwm":		${HIGHWATERMARK},
@@ -142,8 +146,8 @@ do
 		"instance":		$c
 	},
 	"fspaths": {
-		"/zpools/vol1/a/b/c":	"",
-		"/zpools/vol2/m/n/p":	""
+		"/tmp/dfc":	"",
+		"/disk2/dfc":	""
 	},
 	"no_xattrs":			${NOXATTRS}
 }
@@ -160,6 +164,12 @@ done
 #	Log events at or above this severity are logged to standard
 #	error as well as to files.
 
+# build
+go build && go install && GOBIN=$GOPATH/bin go install setup/dfc.go
+if [ $? -ne 0 ]; then
+	exit 1
+fi
+
 # run proxy and storage targets
 for (( c=$START; c<=$END; c++ ))
 do
@@ -167,13 +177,13 @@ do
 	if [ $c -eq 0 ]
 	then
 			set -x
-			go run setup/dfc.go -config=$CONFFILE -role=proxy -ntargets=$servcount $1 $2 &
+			$GOPATH/bin/dfc -config=$CONFFILE -role=proxy -ntargets=$servcount $1 $2 &
 			{ set +x; } 2>/dev/null
 			# wait for the proxy to start up
 			sleep 2
 	else
 			set -x
-			go run setup/dfc.go -config=$CONFFILE -role=target $1 $2 &
+			$GOPATH/bin/dfc -config=$CONFFILE -role=target $1 $2 &
 			{ set +x; } 2>/dev/null
 	fi
 done

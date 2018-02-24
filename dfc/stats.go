@@ -36,6 +36,7 @@ type proxyCoreStats struct {
 	Numput    int64 `json:"numput"`
 	Numpost   int64 `json:"numpost"`
 	Numdelete int64 `json:"numdelete"`
+	Numrename int64 `json:"numrename"`
 	Numerr    int64 `json:"numerr"`
 	Numlist   int64 `json:"numlist"`
 }
@@ -46,8 +47,10 @@ type targetCoreStats struct {
 	Bytesloaded  int64 `json:"bytesloaded"`
 	Bytesevicted int64 `json:"bytesevicted"`
 	Filesevicted int64 `json:"filesevicted"`
-	Numsendfile  int64 `json:"numsendfile"`
-	Numrecvfile  int64 `json:"numrecvfile"`
+	Numsentfiles int64 `json:"numsentfiles"`
+	Numsentbytes int64 `json:"numsentbytes"`
+	Numrecvfiles int64 `json:"numrecvfiles"`
+	Numrecvbytes int64 `json:"numrecvbytes"`
 	Numlist      int64 `json:"numlist"`
 }
 
@@ -99,6 +102,8 @@ func (s *proxyCoreStats) add(name string, val int64) {
 		v = &s.Numpost
 	case "numdelete":
 		v = &s.Numdelete
+	case "numrename":
+		v = &s.Numrename
 	case "numlist":
 		v = &s.Numlist
 	case "numerr":
@@ -119,6 +124,8 @@ func (s *targetCoreStats) add(name string, val int64) {
 		v = &s.Numpost
 	case "numdelete":
 		v = &s.Numdelete
+	case "numrename":
+		v = &s.Numrename
 	case "numerr":
 		v = &s.Numerr
 	case "numcoldget":
@@ -129,10 +136,14 @@ func (s *targetCoreStats) add(name string, val int64) {
 		v = &s.Bytesevicted
 	case "filesevicted":
 		v = &s.Filesevicted
-	case "numsendfile":
-		v = &s.Numsendfile
-	case "numrecvfile":
-		v = &s.Numrecvfile
+	case "numsentfiles":
+		v = &s.Numsentfiles
+	case "numsentbytes":
+		v = &s.Numsentbytes
+	case "numrecvfiles":
+		v = &s.Numrecvfiles
+	case "numrecvbytes":
+		v = &s.Numrecvbytes
 	case "numlist":
 		v = &s.Numlist
 	default:

@@ -26,12 +26,13 @@ type dfconfig struct {
 	LBConf         string            `json:"lb_conf"`
 	StatsTimeStr   string            `json:"stats_time"`
 	StatsTime      time.Duration     `json:"-"` // omitempty
-	HttpTimeoutStr string            `json:"http_timeout"`
-	HttpTimeout    time.Duration     `json:"-"` // omitempty
+	HTTPTimeoutStr string            `json:"http_timeout"`
+	HTTPTimeout    time.Duration     `json:"-"` // omitempty
 	Listen         listenconfig      `json:"listen"`
 	Proxy          proxyconfig       `json:"proxy"`
 	S3             s3config          `json:"s3"`
 	LRUConfig      lruconfig         `json:"lru_config"`
+	CksumConfig    cksumconfig       `json:"cksum_config"`
 	FSpaths        map[string]string `json:"fspaths"`
 	TestFSP        testfspathconf    `json:"test_fspaths"`
 	NoXattrs       bool              `json:"no_xattrs"`
@@ -76,6 +77,11 @@ type proxyconfig struct {
 	Passthru bool   `json:"passthru"` // false: get then redirect, true (default): redirect right away
 }
 
+type cksumconfig struct {
+	// True enables MD5 validation for COLD GET.
+	ValidateColdGet bool `json:"validate_cold_get"`
+}
+
 // Load and validate daemon's config
 func initconfigparam() error {
 	getConfig(clivars.conffile)
@@ -97,7 +103,7 @@ func initconfigparam() error {
 	if ctx.config.TestFSP.Count == 0 {
 		for fp1 := range ctx.config.FSpaths {
 			for fp2 := range ctx.config.FSpaths {
-				if fp1 != fp2 && (strings.HasPrefix(fp1, fp2) || strings.HasPrefix(fp1, fp2)) {
+				if fp1 != fp2 && (strings.HasPrefix(fp1, fp2) || strings.HasPrefix(fp2, fp1)) {
 					glog.Errorf("Invalid fspaths: %q is a prefix or includes as a prefix %q",
 						fp1, fp2)
 					return nil
@@ -141,7 +147,7 @@ func getConfig(fpath string) {
 	if ctx.config.StatsTime, err = time.ParseDuration(ctx.config.StatsTimeStr); err != nil {
 		goto merr
 	}
-	if ctx.config.HttpTimeout, err = time.ParseDuration(ctx.config.HttpTimeoutStr); err != nil {
+	if ctx.config.HTTPTimeout, err = time.ParseDuration(ctx.config.HTTPTimeoutStr); err != nil {
 		goto merr
 	}
 	if ctx.config.LRUConfig.DontEvictTime, err = time.ParseDuration(ctx.config.LRUConfig.DontEvictTimeStr); err != nil {
@@ -150,6 +156,6 @@ func getConfig(fpath string) {
 	return
 merr:
 	glog.Errorf("Bad time duration format [%s, %s, %s], err: %v",
-		ctx.config.StatsTimeStr, ctx.config.HttpTimeoutStr, ctx.config.LRUConfig.DontEvictTimeStr, err)
+		ctx.config.StatsTimeStr, ctx.config.HTTPTimeoutStr, ctx.config.LRUConfig.DontEvictTimeStr, err)
 	os.Exit(1)
 }
