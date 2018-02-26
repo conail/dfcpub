@@ -16,6 +16,7 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
@@ -108,8 +109,22 @@ func (awsimpl *awsimpl) listbucket(bucket string, msg *GetMsg) (jsbytes []byte, 
 func (awsimpl *awsimpl) getobj(fqn, bucket, objname string) (md5hash string, size int64, errstr string, errcode int) {
 	var omd5 string
 	sess := createsession()
-	s3Svc := s3.New(sess)
-	obj, err := s3Svc.GetObject(&s3.GetObjectInput{
+	svc := s3.New(sess)
+	svc.Handlers.Build.PushBack(func(r *request.Request) {
+		r.HTTPRequest.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+	})
+	/*
+		downloader := s3manager.NewDownloaderWithClient(sess, func(d *s3manager.Downloader) {
+			d.PartSize = 10 * 1024 * 1024 * 1024
+			d.Concurrency = 16
+		})
+		numBytes, err := downloader.Download(file,
+			&s3.GetObjectInput{
+				Bucket: aws.String(bucket),
+				Key:    aws.String(objname),
+		})
+	*/
+	obj, err := svc.GetObject(&s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(objname),
 	})
@@ -144,7 +159,11 @@ func (awsimpl *awsimpl) getobj(fqn, bucket, objname string) (md5hash string, siz
 
 func (awsimpl *awsimpl) putobj(file *os.File, bucket, objname string) (errstr string, errcode int) {
 	sess := createsession()
-	uploader := s3manager.NewUploader(sess)
+	svc := s3.New(sess)
+	svc.Handlers.Build.PushBack(func(r *request.Request) {
+		r.HTTPRequest.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+	})
+	uploader := s3manager.NewUploaderWithClient(svc)
 	//
 	// FIXME: use uploader.UploadWithContext() for larger files
 	//
@@ -167,6 +186,9 @@ func (awsimpl *awsimpl) putobj(file *os.File, bucket, objname string) (errstr st
 func (awsimpl *awsimpl) deleteobj(bucket, objname string) (errstr string, errcode int) {
 	sess := createsession()
 	svc := s3.New(sess)
+	svc.Handlers.Build.PushBack(func(r *request.Request) {
+		r.HTTPRequest.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+	})
 	_, err := svc.DeleteObject(&s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String(objname)})
 	if err != nil {
 		errcode = awsErrorToHTTP(err)
