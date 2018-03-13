@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	maxidleconns = 20 // max num idle connections
+	maxidleconns = 4096 // max num idle connections
 )
 const (
 	initialBucketListSize = 512
