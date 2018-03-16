@@ -9,6 +9,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -155,22 +156,25 @@ func (p *proxyrunner) httpfilget(w http.ResponseWriter, r *http.Request) {
 		objname = apitems[1]
 	}
 	if strings.Contains(bucket, "/") {
-		s := fmt.Sprintf("Invalid bucket name %s (contains '/')", bucket)
-		p.invalmsghdlr(w, r, s)
+		errstr := fmt.Sprintf("Invalid bucket name %s (contains '/')", bucket)
+		p.invalmsghdlr(w, r, errstr)
 		return
 	}
 
 	if len(objname) != 0 {
 		p.statsif.add("numget", 1)
-		si := hrwTarget(bucket+"/"+objname, ctx.smap)
-
+		si, errstr := hrwTarget(bucket+"/"+objname, ctx.smap)
+		if errstr != "" {
+			p.invalmsghdlr(w, r, errstr)
+			return
+		}
 		redirecturl := fmt.Sprintf("%s%s?%s=false", si.DirectURL, r.URL.Path, ParamLocal)
 		if glog.V(3) {
 			glog.Infof("Redirecting %q to %s (%s)", r.URL.Path, si.DirectURL, r.Method)
 		}
 		if !ctx.config.Proxy.Passthru && len(objname) > 0 {
 			glog.Infof("passthru=false: proxy initiates the GET %s/%s", bucket, objname)
-			_ = p.receiveDrop(w, r, redirecturl) // ignore error, proceed to http redirect
+			p.receiveDrop(w, r, redirecturl) // ignore error, proceed to http redirect
 		}
 
 		http.Redirect(w, r, redirecturl, http.StatusMovedPermanently)
@@ -412,18 +416,20 @@ func (p *proxyrunner) getCloudBucketObjects(w http.ResponseWriter, r *http.Reque
 }
 
 func (p *proxyrunner) listbucket(w http.ResponseWriter, r *http.Request, bucket string) {
-	const cloudObjecst = false
-	var (
-		err        error
-		allentries *BucketList
-	)
+	var allentries *BucketList
 	listmsgjson, err := ioutil.ReadAll(r.Body)
-	assert(err == nil)
-	errclose := r.Body.Close()
-	assert(errclose == nil)
-	islocal := p.islocalBucket(bucket)
-
-	if islocal {
+	if err != nil {
+		s := fmt.Sprintf("listbucket: Failed to read %s request, err: %v", r.Method, err)
+		if err == io.EOF {
+			trailer := r.Trailer.Get("Error")
+			if trailer != "" {
+				s = fmt.Sprintf("listbucket: Failed to read %s request, err: %v, trailer: %s", r.Method, err, trailer)
+			}
+		}
+		p.invalmsghdlr(w, r, s)
+		return
+	}
+	if p.islocalBucket(bucket) {
 		allentries, err = p.getLocalBucketObjects(w, r, bucket, listmsgjson)
 	} else {
 		allentries, err = p.getCloudBucketObjects(w, r, bucket, listmsgjson)
@@ -432,39 +438,33 @@ func (p *proxyrunner) listbucket(w http.ResponseWriter, r *http.Request, bucket 
 		p.invalmsghdlr(w, r, err.Error())
 		return
 	}
-
 	jsbytes, err := json.Marshal(allentries)
 	assert(err == nil, err)
 	_ = p.writeJSON(w, r, jsbytes, "listbucket")
 }
 
 // receiveDrop reads until EOF and uses dummy writer (ReadToNull)
-func (p *proxyrunner) receiveDrop(w http.ResponseWriter, r *http.Request, redirecturl string) error {
+func (p *proxyrunner) receiveDrop(w http.ResponseWriter, r *http.Request, redirecturl string) {
 	if glog.V(3) {
 		glog.Infof("GET redirect URL %q", redirecturl)
 	}
 	newr, err := http.Get(redirecturl)
 	if err != nil {
 		glog.Errorf("Failed to GET redirect URL %q, err: %v", redirecturl, err)
-		return err
+		return
 	}
-	defer func() {
-		if newr != nil {
-			err = newr.Body.Close()
-		}
-	}()
+	defer newr.Body.Close()
+
 	bufreader := bufio.NewReader(newr.Body)
 	bytes, err := ReadToNull(bufreader)
 	if err != nil {
 		glog.Errorf("Failed to copy data to http, URL %q, err: %v", redirecturl, err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		p.statsif.add("numerr", 1)
-		return err
+		return
 	}
 	if glog.V(3) {
 		glog.Infof("Received and discarded %q (size %.2f MB)", redirecturl, float64(bytes)/1000/1000)
 	}
-	return err
+	return
 }
 
 // PUT "/"+Rversion+"/"+Rfiles
@@ -481,7 +481,11 @@ func (p *proxyrunner) httpfilput(w http.ResponseWriter, r *http.Request) {
 	if glog.V(3) {
 		glog.Infof("%s %s/%s", r.Method, bucket, objname)
 	}
-	si := hrwTarget(bucket+"/"+objname, ctx.smap)
+	si, errstr := hrwTarget(bucket+"/"+objname, ctx.smap)
+	if errstr != "" {
+		p.invalmsghdlr(w, r, errstr)
+		return
+	}
 	redirecturl := si.DirectURL + r.URL.Path
 	if glog.V(3) {
 		glog.Infof("Redirecting %q to %s (%s)", r.URL.Path, si.DirectURL, r.Method)
@@ -504,7 +508,11 @@ func (p *proxyrunner) httpfildelete(w http.ResponseWriter, r *http.Request) {
 		if glog.V(3) {
 			glog.Infof("%s %s/%s", r.Method, bucket, objname)
 		}
-		si := hrwTarget(bucket+"/"+objname, ctx.smap)
+		si, errstr := hrwTarget(bucket+"/"+objname, ctx.smap)
+		if errstr != "" {
+			p.invalmsghdlr(w, r, errstr)
+			return
+		}
 		redirecturl := si.DirectURL + r.URL.Path
 		if glog.V(3) {
 			glog.Infof("Redirecting %q to %s (%s)", r.URL.Path, si.DirectURL, r.Method)
@@ -514,18 +522,20 @@ func (p *proxyrunner) httpfildelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if p.readJSON(w, r, &msg) != nil {
+	if err := p.readJSON(w, r, &msg); err != nil {
+		s := fmt.Sprintf("Could not read JSON Body: %v", err)
+		p.invalmsghdlr(w, r, s)
 		return
 	}
 	p.statsif.add("numdelete", 1)
 	switch msg.Action {
 	case ActDestroyLB:
 		p.deleteLocalBucket(w, r, bucket)
-		return
+	case ActDelete, ActEvict:
+		p.actionlistrange(w, r, &msg)
+	default:
+		p.invalmsghdlr(w, r, fmt.Sprintf("Unsupported Action: %s", msg.Action))
 	}
-
-	p.invalmsghdlr(w, r, "Cannot DELETE non-local bucket")
-	return
 }
 
 func (p *proxyrunner) deleteLocalBucket(w http.ResponseWriter, r *http.Request, lbucket string) {
@@ -578,7 +588,7 @@ func (p *proxyrunner) httpfilpost(w http.ResponseWriter, r *http.Request) {
 		p.filrename(w, r, &msg)
 		return
 	case ActPrefetch:
-		p.filprefetch(w, r, &msg)
+		p.actionlistrange(w, r, &msg)
 		return
 	default:
 		s := fmt.Sprintf("Unexpected ActionMsg <- JSON [%v]", msg)
@@ -614,7 +624,11 @@ func (p *proxyrunner) filrename(w http.ResponseWriter, r *http.Request, msg *Act
 	}
 	p.lbmap.unlock()
 
-	si := hrwTarget(lbucket+"/"+objname, ctx.smap)
+	si, errstr := hrwTarget(lbucket+"/"+objname, ctx.smap)
+	if errstr != "" {
+		p.invalmsghdlr(w, r, errstr)
+		return
+	}
 	redirecturl := si.DirectURL + r.URL.Path
 	if glog.V(3) {
 		glog.Infof("Redirecting %q to %s (rename)", r.URL.Path, si.DirectURL)
@@ -626,9 +640,10 @@ func (p *proxyrunner) filrename(w http.ResponseWriter, r *http.Request, msg *Act
 	http.Redirect(w, r, redirecturl, http.StatusTemporaryRedirect)
 }
 
-func (p *proxyrunner) filprefetch(w http.ResponseWriter, r *http.Request, actionMsg *ActionMsg) {
+func (p *proxyrunner) actionlistrange(w http.ResponseWriter, r *http.Request, actionMsg *ActionMsg) {
 	var (
-		err error
+		err    error
+		method string
 	)
 
 	apitems := p.restAPIItems(r.URL.Path, 5)
@@ -637,26 +652,32 @@ func (p *proxyrunner) filprefetch(w http.ResponseWriter, r *http.Request, action
 	}
 	bucket := apitems[0]
 	wait := false
-	if actionMsg.Action == ActPrefetch {
-		if jsmap, ok := actionMsg.Value.(map[string]interface{}); !ok {
-			p.statsif.add("numerr", 1)
-			glog.Errorf("Failed to unmarshal JSMAP: Not a map[string]interface")
+	if jsmap, ok := actionMsg.Value.(map[string]interface{}); !ok {
+		s := fmt.Sprintf("Failed to unmarshal JSMAP: Not a map[string]interface")
+		p.invalmsghdlr(w, r, s)
+		return
+	} else if waitstr, ok := jsmap["wait"]; ok {
+		if wait, ok = waitstr.(bool); !ok {
+			s := fmt.Sprintf("Failed to read ListRangeMsgBase Wait: Not a bool")
+			p.invalmsghdlr(w, r, s)
 			return
-		} else if w, ok := jsmap["wait"]; ok {
-			if wait, ok = w.(bool); !ok {
-				p.statsif.add("numerr", 1)
-				glog.Errorf("Failed to read PrefetchMsgBase Wait: Not a bool")
-				return
-			}
 		}
 	}
 	// Send json message to all
 	jsonbytes, err := json.Marshal(actionMsg)
-	if err != nil {
-		p.statsif.add("numerr", 1)
-		glog.Errorf("Failed to re-marshal Prefetch JSON: %v", err)
+	assert(err == nil, err)
+
+	switch actionMsg.Action {
+	case ActEvict, ActDelete:
+		method = http.MethodDelete
+	case ActPrefetch:
+		method = http.MethodPost
+	default:
+		s := fmt.Sprintf("Action unavailable for List/Range Operations: %s", actionMsg.Action)
+		p.invalmsghdlr(w, r, s)
 		return
 	}
+
 	wg := &sync.WaitGroup{}
 	for _, si := range ctx.smap.Smap {
 		wg.Add(1)
@@ -669,19 +690,19 @@ func (p *proxyrunner) filprefetch(w http.ResponseWriter, r *http.Request, action
 				url     = si.DirectURL + "/" + Rversion + "/" + Rfiles + "/" + bucket
 			)
 			if wait {
-				_, err, errstr, errcode = p.call(si, url, http.MethodPost, jsonbytes, 0)
+				_, err, errstr, errcode = p.call(si, url, method, jsonbytes, 0)
 			} else {
-				_, err, errstr, errcode = p.call(si, url, http.MethodPost, jsonbytes)
+				_, err, errstr, errcode = p.call(si, url, method, jsonbytes)
 			}
 			if err != nil {
-				p.statsif.add("numerr", 1)
-				glog.Errorf("Failed to execute Prefetch request: %v (%d: %s)", err, errcode, errstr)
+				s := fmt.Sprintf("Failed to execute List/Range request: %v (%d: %s)", err, errcode, errstr)
+				p.invalmsghdlr(w, r, s)
 				return
 			}
 		}(si)
 	}
 	wg.Wait()
-	glog.Infoln("Completed sending Prefetch ActionMsg to all targets")
+	glog.Infoln("Completed sending List/Range ActionMsg to all targets")
 }
 
 func (p *proxyrunner) httpfilhead(w http.ResponseWriter, r *http.Request) {
