@@ -1,12 +1,10 @@
-// Package dfc provides distributed file-based cache with Amazon and Google Cloud backends._test
 /*
- * Copyright (c) 2017, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
  *
  */
 package dfc_test
 
 import (
-	"bytes"
 	"crypto/md5"
 	"encoding/binary"
 	"encoding/hex"
@@ -23,6 +21,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NVIDIA/dfcpub/pkg/client/readers"
+
 	"github.com/NVIDIA/dfcpub/dfc"
 	"github.com/NVIDIA/dfcpub/pkg/client"
 	"github.com/OneOfOne/xxhash"
@@ -31,7 +31,7 @@ import (
 // usage examples:
 // # go test ./tests -v -run=regression
 // # go test ./tests -v -run=down -args -bucket=mybucket
-// # go test ./tests -v -run=list -bucket=otherbucket
+// # go test ./tests -v -run=list -bucket=otherbucket -prefix=smoke/obj -props=atime,ctime,iscached,checksum,version,size
 // # go test ./tests -v -run=smoke -numworkers=4
 // # go test ./tests -v -run=xxx -bench . -count 10
 
@@ -57,6 +57,7 @@ var (
 	clichecksum string
 	totalio     int64
 	proxyurl    string
+	props       string
 )
 
 // worker's result
@@ -89,10 +90,27 @@ func init() {
 	flag.StringVar(&match, "match", ".*", "object name regex")
 	flag.StringVar(&clichecksum, "checksum", "all", "all | xxhash | coldmd5")
 	flag.Int64Var(&totalio, "totalio", 80, "Total IO Size in MB")
+	flag.StringVar(&props, "props", "", "List of object properties to return. Empty value means default set of properties")
+}
+
+func checkMemory() {
+	if readerType == readers.ReaderTypeSG || readerType == readers.ReaderTypeInMem {
+		megabytes, _ := dfc.TotalMemory()
+		if megabytes < PhysMemSizeWarn {
+			fmt.Fprintf(os.Stderr, "Warning: host memory size = %dMB may be insufficient, consider use other reader type\n", megabytes)
+		}
+	}
+}
+
+func parse() {
+	flag.Parse()
+	usingSG = readerType == readers.ReaderTypeSG
+	usingFile = readerType == readers.ReaderTypeFile
+	checkMemory()
 }
 
 func Test_download(t *testing.T) {
-	flag.Parse()
+	parse()
 
 	if err := client.Tcping(proxyurl); err != nil {
 		tlogf("%s: %v\n", proxyurl, err)
@@ -105,7 +123,6 @@ func Test_download(t *testing.T) {
 	filesCreated := make(chan string, numfiles)
 
 	defer func() {
-		//Delete files created by getAndCopyTmp
 		close(filesCreated)
 		var err error
 		for file := range filesCreated {
@@ -178,7 +195,7 @@ func Test_download(t *testing.T) {
 
 // delete existing objects that match the regex
 func Test_matchdelete(t *testing.T) {
-	flag.Parse()
+	parse()
 
 	// Declare one channel per worker to pass the keyname
 	keyname_chans := make([]chan string, numworkers)
@@ -239,19 +256,23 @@ func Test_matchdelete(t *testing.T) {
 
 // PUT, then delete
 func Test_putdelete(t *testing.T) {
-	flag.Parse()
-	var fbuffer *bytes.Buffer
+	parse()
+
+	var sgl *dfc.SGLIO
 	if err := dfc.CreateDir(DeleteDir); err != nil {
 		t.Fatalf("Failed to create dir %s, err: %v", DeleteDir, err)
 	}
+
 	errch := make(chan error, numfiles)
 	filesput := make(chan string, numfiles)
 	filesize := uint64(512 * 1024)
-	if inmem {
-		fbuf := make([]byte, filesize)
-		fbuffer = bytes.NewBuffer(fbuf)
+
+	if usingSG {
+		sgl = dfc.NewSGLIO(filesize)
+		defer sgl.Free()
 	}
-	putRandomFiles(0, baseseed, filesize, numfiles, clibucket, t, nil, errch, filesput, DeleteDir, DeleteStr, "", false, fbuffer)
+
+	putRandomFiles(0, baseseed, filesize, numfiles, clibucket, t, nil, errch, filesput, DeleteDir, DeleteStr, "", false, sgl)
 	close(filesput)
 
 	// Declare one channel per worker to pass the keyname
@@ -260,6 +281,7 @@ func Test_putdelete(t *testing.T) {
 		// Allow a bunch of messages at a time to be written asynchronously to a channel
 		keynameChans[i] = make(chan string, 100)
 	}
+
 	// Start the worker pools
 	var wg = &sync.WaitGroup{}
 	// Get the workers started
@@ -270,9 +292,10 @@ func Test_putdelete(t *testing.T) {
 
 	num := 0
 	for name := range filesput {
-		if fbuffer == nil {
+		if usingFile {
 			os.Remove(DeleteDir + "/" + name)
 		}
+
 		keynameChans[num%numworkers] <- DeleteStr + "/" + name
 		num++
 	}
@@ -281,21 +304,32 @@ func Test_putdelete(t *testing.T) {
 	for i := 0; i < numworkers; i++ {
 		close(keynameChans[i])
 	}
+
 	wg.Wait()
 	selectErr(errch, "delete", t, false)
 }
 
 func Test_list(t *testing.T) {
+	parse()
+
 	var (
 		copy    bool
 		reslist *dfc.BucketList
 		file    *os.File
 		err     error
 	)
-	flag.Parse()
 
 	// list the names, sizes, creation times and MD5 checksums
-	var msg = &dfc.GetMsg{GetProps: dfc.GetPropsSize + ", " + dfc.GetPropsCtime + ", " + dfc.GetPropsChecksum + ", " + dfc.GetPropsVersion}
+	var msg *dfc.GetMsg
+	if props == "" {
+		msg = &dfc.GetMsg{GetProps: dfc.GetPropsSize + ", " + dfc.GetPropsCtime + ", " + dfc.GetPropsChecksum + ", " + dfc.GetPropsVersion}
+	} else {
+		msg = &dfc.GetMsg{GetProps: props}
+	}
+	if prefix != "" {
+		msg.GetPrefix = prefix
+	}
+	tlogf("Displaying properties: %s\n", msg.GetProps)
 
 	bucket := clibucket
 	fname := LocalDestDir + "/" + bucket
@@ -312,6 +346,7 @@ func Test_list(t *testing.T) {
 		}
 	}
 
+	totalObjs := 0
 	for {
 		jsbytes, err := json.Marshal(msg)
 		if err != nil {
@@ -323,7 +358,7 @@ func Test_list(t *testing.T) {
 			return
 		}
 		if len(reslist.Entries) > 1000 {
-			t.Errorf("Page Size (%d) Exceeded: %d entries\n", len(reslist.Entries))
+			t.Errorf("Exceeded: %d entries\n", len(reslist.Entries))
 		}
 		if copy {
 			for _, m := range reslist.Entries {
@@ -333,11 +368,12 @@ func Test_list(t *testing.T) {
 		} else {
 			for _, m := range reslist.Entries {
 				if len(m.Checksum) > 8 {
-					tlogf("%s %d %s [%s] %s\n", m.Name, m.Size, m.Ctime, m.Version, m.Checksum[:8]+"...")
+					tlogf("%s %d %s [%s] %s [%v - %s]\n", m.Name, m.Size, m.Ctime, m.Version, m.Checksum[:8]+"...", m.IsCached, m.Atime)
 				} else {
-					tlogf("%s %d %s [%s] %s\n", m.Name, m.Size, m.Ctime, m.Version, m.Checksum)
+					tlogf("%s %d %s [%s] %s [%v - %s]\n", m.Name, m.Size, m.Ctime, m.Version, m.Checksum, m.IsCached, m.Atime)
 				}
 			}
+			totalObjs += len(reslist.Entries)
 		}
 
 		if reslist.PageMarker == "" {
@@ -346,6 +382,7 @@ func Test_list(t *testing.T) {
 
 		msg.GetPageMarker = reslist.PageMarker
 	}
+	tlogf("-----------------\nTotal objects listed: %v\n", totalObjs)
 }
 
 func Test_coldgetmd5(t *testing.T) {
@@ -358,8 +395,9 @@ func Test_coldgetmd5(t *testing.T) {
 		bucket    = clibucket
 		totalsize = numPuts * largefilesize
 		filesize  = uint64(largefilesize * 1024 * 1024)
-		fbuffer   *bytes.Buffer
+		sgl       *dfc.SGLIO
 	)
+
 	ldir := LocalSrcDir + "/" + ColdValidStr
 	if err := dfc.CreateDir(ldir); err != nil {
 		t.Fatalf("Failed to create dir %s, err: %v", ldir, err)
@@ -369,15 +407,12 @@ func Test_coldgetmd5(t *testing.T) {
 	cksumconfig := config["cksum_config"].(map[string]interface{})
 	bcoldget := cksumconfig["validate_cold_get"].(bool)
 
-	if inmem {
-		megabytes, _ := dfc.TotalMemory()
-		if megabytes < PhysMemSizeWarn {
-			fmt.Fprintf(os.Stderr, "Warning: host memory size = %dMB may be insufficient, consider -inmem=false\n", megabytes)
-		}
-		fbuf := make([]byte, filesize)
-		fbuffer = bytes.NewBuffer(fbuf)
+	if usingSG {
+		sgl = dfc.NewSGLIO(filesize)
+		defer sgl.Free()
 	}
-	putRandomFiles(0, baseseed, filesize, numPuts, bucket, t, nil, errch, filesput, ldir, ColdValidStr, "", true, fbuffer)
+
+	putRandomFiles(0, baseseed, filesize, numPuts, bucket, t, nil, errch, filesput, ldir, ColdValidStr, "", true, sgl)
 	selectErr(errch, "put", t, false)
 	close(filesput) // to exit for-range
 	for fname := range filesput {
@@ -412,9 +447,10 @@ func Test_coldgetmd5(t *testing.T) {
 cleanup:
 	setConfig("validate_cold_get", strconv.FormatBool(bcoldget), proxyurl+"/v1/cluster", httpclient, t)
 	for _, fn := range fileslist {
-		if fbuffer == nil {
+		if usingFile {
 			_ = os.Remove(LocalSrcDir + "/" + fn)
 		}
+
 		wg.Add(1)
 		go client.Del(proxyurl, bucket, fn, wg, errch, false)
 	}
@@ -456,91 +492,99 @@ func Benchmark_get(b *testing.B) {
 
 func getAndCopyTmp(id int, keynames <-chan string, t *testing.T, wg *sync.WaitGroup,
 	errch chan error, resch chan workres, bucket string) {
-	var (
-		written int64
-		errstr  string
-		geturl  = proxyurl + "/v1/files"
-	)
+	geturl := proxyurl + "/v1/files"
 	res := workres{0, 0}
 	defer wg.Done()
 
 	for keyname := range keynames {
 		url := geturl + "/" + bucket + "/" + keyname
-		t.Logf("Worker %2d: GET %q", id, url)
-		r, err := http.Get(url)
-		hdhash := r.Header.Get(dfc.HeaderDfcChecksumVal)
-		hdhashtype := r.Header.Get(dfc.HeaderDfcChecksumType)
-		if testfail(err, fmt.Sprintf("Worker %2d: get key %s from bucket %s", id, keyname, bucket), r, errch, t) {
-			t.Errorf("Failing test")
+		written, failed := getAndCopyOne(id, t, errch, bucket, keyname, url)
+		if failed {
+			t.Fail()
 			return
-		}
-		defer func(r *http.Response) {
-			r.Body.Close()
-		}(r)
-		// Create a local copy
-		fname := LocalDestDir + "/" + keyname
-		file, err := dfc.Createfile(fname)
-		if err != nil {
-			t.Errorf("Worker %2d: Failed to create file, err: %v", id, err)
-			return
-		}
-		defer func() {
-			if err := file.Close(); err != nil {
-				errstr = fmt.Sprintf("Failed to close file, err: %s", err)
-				t.Errorf("Worker %2d: %s", id, errstr)
-			}
-		}()
-		if hdhashtype == dfc.ChecksumXXHash {
-			xx := xxhash.New64()
-			written, errstr = dfc.ReceiveFile(file, r.Body, nil, xx)
-			if errstr != "" {
-				t.Errorf("Worker %2d: failed to write file, err: %s", id, errstr)
-				return
-			}
-			hashIn64 := xx.Sum64()
-			hashInBytes := make([]byte, 8)
-			binary.BigEndian.PutUint64(hashInBytes, uint64(hashIn64))
-			hash := hex.EncodeToString(hashInBytes)
-			if hdhash != hash {
-				t.Errorf("Worker %2d: header's %s %s doesn't match the file's %s", id, dfc.ChecksumXXHash, hdhash, hash)
-				resch <- res
-				close(resch)
-				return
-			}
-			tlogf("Worker %2d: header's %s checksum %s matches the file's %s\n", id, dfc.ChecksumXXHash, hdhash, hash)
-		} else if hdhashtype == dfc.ChecksumMD5 {
-			md5 := md5.New()
-			written, errstr = dfc.ReceiveFile(file, r.Body, nil, md5)
-			if errstr != "" {
-				t.Errorf("Worker %2d: failed to write file, err: %s", id, errstr)
-				return
-			}
-			hashInBytes := md5.Sum(nil)[:16]
-			md5hash := hex.EncodeToString(hashInBytes)
-			if errstr != "" {
-				t.Errorf("Worker %2d: failed to compute %s, err: %s", id, dfc.ChecksumMD5, errstr)
-				return
-			}
-			if hdhash != md5hash {
-				t.Errorf("Worker %2d: header's %s %s doesn't match the file's %s", id, dfc.ChecksumMD5, hdhash, md5hash)
-				resch <- res
-				close(resch)
-				return
-			}
-			tlogf("Worker %2d: header's %s checksum %s matches the file's %s\n", id, dfc.ChecksumMD5, hdhash, md5hash)
-		} else {
-			written, errstr = dfc.ReceiveFile(file, r.Body, nil)
-			if errstr != "" {
-				t.Errorf("Worker %2d: failed to write file, err: %s", id, errstr)
-				return
-			}
 		}
 		res.totfiles++
 		res.totbytes += written
 	}
-	// Send information back
 	resch <- res
 	close(resch)
+}
+
+func getAndCopyOne(id int, t *testing.T, errch chan error, bucket, keyname, url string) (written int64, failed bool) {
+	var errstr string
+	t.Logf("Worker %2d: GET %q", id, url)
+	r, err := http.Get(url)
+	hdhash := r.Header.Get(dfc.HeaderDfcChecksumVal)
+	hdhashtype := r.Header.Get(dfc.HeaderDfcChecksumType)
+	if testfail(err, fmt.Sprintf("Worker %2d: get key %s from bucket %s", id, keyname, bucket), r, errch, t) {
+		t.Errorf("Failing test")
+		failed = true
+		return
+	}
+	defer func(r *http.Response) {
+		r.Body.Close()
+	}(r)
+	// Create a local copy
+	fname := LocalDestDir + "/" + keyname
+	file, err := dfc.Createfile(fname)
+	if err != nil {
+		t.Errorf("Worker %2d: Failed to create file, err: %v", id, err)
+		failed = true
+		return
+	}
+	defer func() {
+		if err := file.Close(); err != nil {
+			errstr = fmt.Sprintf("Failed to close file, err: %s", err)
+			t.Errorf("Worker %2d: %s", id, errstr)
+		}
+	}()
+	if hdhashtype == dfc.ChecksumXXHash {
+		xx := xxhash.New64()
+		written, errstr = dfc.ReceiveFile(file, r.Body, nil, xx)
+		if errstr != "" {
+			t.Errorf("Worker %2d: failed to write file, err: %s", id, errstr)
+			failed = true
+			return
+		}
+		hashIn64 := xx.Sum64()
+		hashInBytes := make([]byte, 8)
+		binary.BigEndian.PutUint64(hashInBytes, uint64(hashIn64))
+		hash := hex.EncodeToString(hashInBytes)
+		if hdhash != hash {
+			t.Errorf("Worker %2d: header's %s %s doesn't match the file's %s", id, dfc.ChecksumXXHash, hdhash, hash)
+			failed = true
+			return
+		}
+		tlogf("Worker %2d: header's %s checksum %s matches the file's %s\n", id, dfc.ChecksumXXHash, hdhash, hash)
+	} else if hdhashtype == dfc.ChecksumMD5 {
+		md5 := md5.New()
+		written, errstr = dfc.ReceiveFile(file, r.Body, nil, md5)
+		if errstr != "" {
+			t.Errorf("Worker %2d: failed to write file, err: %s", id, errstr)
+			return
+		}
+		hashInBytes := md5.Sum(nil)[:16]
+		md5hash := hex.EncodeToString(hashInBytes)
+		if errstr != "" {
+			t.Errorf("Worker %2d: failed to compute %s, err: %s", id, dfc.ChecksumMD5, errstr)
+			failed = true
+			return
+		}
+		if hdhash != md5hash {
+			t.Errorf("Worker %2d: header's %s %s doesn't match the file's %s", id, dfc.ChecksumMD5, hdhash, md5hash)
+			failed = true
+			return
+		}
+		tlogf("Worker %2d: header's %s checksum %s matches the file's %s\n", id, dfc.ChecksumMD5, hdhash, md5hash)
+	} else {
+		written, errstr = dfc.ReceiveFile(file, r.Body, nil)
+		if errstr != "" {
+			t.Errorf("Worker %2d: failed to write file, err: %s", id, errstr)
+			failed = true
+			return
+		}
+	}
+	return
 }
 
 func deleteFiles(keynames <-chan string, t *testing.T, wg *sync.WaitGroup, errch chan error, bucket string) {
@@ -674,7 +718,7 @@ func Test_checksum(t *testing.T) {
 		htype       string
 		numPuts     = 5
 		filesize    = uint64(largefilesize * 1024 * 1024)
-		fbuffer     *bytes.Buffer
+		sgl         *dfc.SGLIO
 	)
 	totalio := (numPuts * largefilesize)
 
@@ -691,15 +735,12 @@ func Test_checksum(t *testing.T) {
 		htype = ochksum
 	}
 
-	if inmem {
-		megabytes, _ := dfc.TotalMemory()
-		if megabytes < PhysMemSizeWarn {
-			fmt.Fprintf(os.Stderr, "Warning: host memory size = %dMB may be insufficient, consider -inmem=false\n", megabytes)
-		}
-		fbuf := make([]byte, filesize)
-		fbuffer = bytes.NewBuffer(fbuf)
+	if usingSG {
+		sgl = dfc.NewSGLIO(filesize)
+		defer sgl.Free()
 	}
-	putRandomFiles(0, 0, filesize, int(numPuts), bucket, t, nil, errch, filesput, ldir, ChksumValidStr, htype, true, fbuffer)
+
+	putRandomFiles(0, 0, filesize, int(numPuts), bucket, t, nil, errch, filesput, ldir, ChksumValidStr, htype, true, sgl)
 	selectErr(errch, "put", t, false)
 	close(filesput) // to exit for-range
 	for fname := range filesput {
@@ -776,7 +817,7 @@ func deletefromfilelist(t *testing.T, bucket string, errch chan error, fileslist
 	wg := &sync.WaitGroup{}
 	// Delete local file and objects from bucket
 	for _, fn := range fileslist {
-		if !inmem {
+		if usingFile {
 			err := os.Remove(LocalSrcDir + "/" + fn)
 			if err != nil {
 				t.Error(err)

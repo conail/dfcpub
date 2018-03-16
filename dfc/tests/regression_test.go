@@ -23,6 +23,7 @@ import (
 
 	"github.com/NVIDIA/dfcpub/dfc"
 	"github.com/NVIDIA/dfcpub/pkg/client"
+	"github.com/NVIDIA/dfcpub/pkg/client/readers"
 )
 
 type Test struct {
@@ -42,6 +43,7 @@ var (
 	GetConfigMsg         = dfc.GetMsg{GetWhat: dfc.GetWhatConfig}
 	GetStatsMsg          = dfc.GetMsg{GetWhat: dfc.GetWhatStats}
 	CreateLocalBucketMsg = dfc.ActionMsg{Action: dfc.ActCreateLB}
+	DeleteLocalBucketMsg = dfc.ActionMsg{Action: dfc.ActDestroyLB}
 	GetSmapMsg           = dfc.GetMsg{GetWhat: dfc.GetWhatSmap}
 	RenameMsg            = dfc.ActionMsg{Action: dfc.ActRename}
 	HighWaterMark        = uint32(80)
@@ -69,12 +71,16 @@ var (
 		Test{"PrefetchRange", regressionPrefetchRange},
 	}
 	abortonerr      = false
-	inmem           = true
+	readerType      = readers.ReaderTypeSG
 	failLRU         = ""
 	prefetchPrefix  = "__bench/test-"
 	prefetchRegex   = "^\\d22\\d"
 	prefetchRange   = "0:2000"
 	PhysMemSizeWarn = uint64(7 * 1024) // MBs
+
+	// Following flags are set by parse()
+	usingSG   bool // True if using SGL as reader backing memory
+	usingFile bool // True if using file as reader backing
 )
 
 func init() {
@@ -82,21 +88,17 @@ func init() {
 	flag.StringVar(&prefetchPrefix, "prefetchprefix", prefetchPrefix, "Prefix for Prefix-Regex Prefetch")
 	flag.StringVar(&prefetchRegex, "prefetchregex", prefetchRegex, "Regex for Prefix-Regex Prefetch")
 	flag.StringVar(&prefetchRange, "prefetchrange", prefetchRange, "Range for Prefix-Regex Prefetch")
-	flag.BoolVar(&inmem, "inmem", inmem, "stream random files from memory")
+	flag.StringVar(&readerType, "readertype", readers.ReaderTypeSG,
+		fmt.Sprintf("Type of reader. {%s(default) | %s | %s | %s", readers.ReaderTypeSG,
+			readers.ReaderTypeFile, readers.ReaderTypeInMem, readers.ReaderTypeRand))
 }
 
 func Test_regression(t *testing.T) {
-	flag.Parse()
+	parse()
 
 	if err := client.Tcping(proxyurl); err != nil {
 		tlogf("%s: %v\n", proxyurl, err)
 		os.Exit(1)
-	}
-	if inmem {
-		megabytes, _ := dfc.TotalMemory()
-		if megabytes < PhysMemSizeWarn {
-			fmt.Fprintf(os.Stderr, "Warning: host memory size = %dMB may be insufficient, consider -inmem=false\n", megabytes)
-		}
 	}
 
 	tlogf("=== abortonerr = %v, proxyurl = %s\n\n", abortonerr, proxyurl)
@@ -141,25 +143,28 @@ func regressionBucket(httpclient *http.Client, t *testing.T, bucket string) {
 		filesput = make(chan string, numPuts)
 		errch    = make(chan error, 100)
 		wg       = &sync.WaitGroup{}
-		fbuffer  *bytes.Buffer
+		sgl      *dfc.SGLIO
 		filesize = uint64(1024)
 	)
-	if inmem {
-		fbuf := make([]byte, filesize)
-		fbuffer = bytes.NewBuffer(fbuf)
+
+	if usingSG {
+		sgl = dfc.NewSGLIO(filesize)
+		defer sgl.Free()
 	}
-	putRandomFiles(0, baseseed+2, filesize, numPuts, bucket, t, nil, errch, filesput, SmokeDir, smokestr, "", false, fbuffer)
+
+	putRandomFiles(0, baseseed+2, filesize, numPuts, bucket, t, nil, errch, filesput, SmokeDir, smokestr, "", false, sgl)
 	close(filesput)
 	selectErr(errch, "put", t, false)
 	getRandomFiles(0, 0, numPuts, bucket, t, nil, errch)
 	selectErr(errch, "get", t, false)
 	for fname := range filesput {
-		if fbuffer == nil {
+		if usingFile {
 			err := os.Remove(SmokeDir + "/" + fname)
 			if err != nil {
 				t.Error(err)
 			}
 		}
+
 		wg.Add(1)
 		go client.Del(proxyurl, bucket, "smoke/"+fname, wg, errch, false)
 	}
@@ -384,7 +389,7 @@ func regressionRebalance(t *testing.T) {
 		filesput = make(chan string, numPuts)
 		errch    = make(chan error, 100)
 		wg       = &sync.WaitGroup{}
-		fbuffer  *bytes.Buffer
+		sgl      *dfc.SGLIO
 		filesize = uint64(1024 * 128)
 	)
 	filesSentOrig := make(map[string]int64)
@@ -416,11 +421,12 @@ func regressionRebalance(t *testing.T) {
 	//
 	// step 2. put random files => (cluster - 1)
 	//
-	if inmem {
-		fbuf := make([]byte, filesize)
-		fbuffer = bytes.NewBuffer(fbuf)
+	if usingSG {
+		sgl = dfc.NewSGLIO(filesize)
+		defer sgl.Free()
 	}
-	putRandomFiles(0, baseseed, filesize, numPuts, clibucket, t, nil, errch, filesput, SmokeDir, smokestr, "", false, fbuffer)
+
+	putRandomFiles(0, baseseed, filesize, numPuts, clibucket, t, nil, errch, filesput, SmokeDir, smokestr, "", false, sgl)
 	selectErr(errch, "put", t, false)
 
 	//
@@ -460,12 +466,13 @@ func regressionRebalance(t *testing.T) {
 	//
 	close(filesput) // to exit for-range
 	for fname := range filesput {
-		if fbuffer == nil {
+		if usingFile {
 			err := os.Remove(SmokeDir + "/" + fname)
 			if err != nil {
 				t.Error(err)
 			}
 		}
+
 		wg.Add(1)
 		go client.Del(proxyurl, clibucket, "smoke/"+fname, wg, errch, false)
 	}
@@ -489,7 +496,7 @@ func regressionRename(t *testing.T) {
 		errch     = make(chan error, numPuts)
 		basenames = make([]string, 0, numPuts) // basenames
 		bnewnames = make([]string, 0, numPuts) // new basenames
-		fbuffer   *bytes.Buffer
+		sgl       *dfc.SGLIO
 	)
 	// create & put
 	createLocalBucket(httpclient, t, RenameLocalBucketName)
@@ -500,7 +507,8 @@ func regressionRename(t *testing.T) {
 			wg.Add(1)
 			go client.Del(proxyurl, RenameLocalBucketName, RenameStr+"/"+fname, wg, errch, false)
 		}
-		if fbuffer == nil {
+
+		if usingFile {
 			for _, fname := range basenames {
 				err = os.Remove(RenameDir + "/" + fname)
 				if err != nil {
@@ -508,6 +516,7 @@ func regressionRename(t *testing.T) {
 				}
 			}
 		}
+
 		wg.Wait()
 		selectErr(errch, "delete", t, false)
 		close(errch)
@@ -519,11 +528,13 @@ func regressionRename(t *testing.T) {
 	if err = dfc.CreateDir(RenameDir); err != nil {
 		t.Errorf("Error creating dir: %v", err)
 	}
-	if inmem {
-		fbuf := make([]byte, 1024*1024)
-		fbuffer = bytes.NewBuffer(fbuf)
+
+	if usingSG {
+		sgl = dfc.NewSGLIO(1024 * 1024)
+		defer sgl.Free()
 	}
-	putRandomFiles(0, baseseed+1, 0, numPuts, RenameLocalBucketName, t, nil, nil, filesput, RenameDir, RenameStr, "", false, fbuffer)
+
+	putRandomFiles(0, baseseed+1, 0, numPuts, RenameLocalBucketName, t, nil, nil, filesput, RenameDir, RenameStr, "", false, sgl)
 	selectErr(errch, "put", t, false)
 	close(filesput)
 	for fname := range filesput {
@@ -672,16 +683,18 @@ func regressionPrefetchRange(t *testing.T) {
 	msg := dfc.GetMsg{}
 	objsToFilter := testListBucketAll(t, clibucket, msg)
 	files := make([]string, 0)
-	for _, be := range objsToFilter.Entries {
-		if oname := strings.TrimPrefix(be.Name, prefetchPrefix); oname != be.Name {
-			s := re.FindStringSubmatch(oname)
-			if s == nil {
-				continue
-			}
-			if i, err := strconv.ParseInt(s[0], 10, 64); err != nil && s[0] != "" {
-				continue
-			} else if s[0] == "" || (rmin == 0 && rmax == 0) || (i >= rmin && i <= rmax) {
-				files = append(files, be.Name)
+	if objsToFilter != nil {
+		for _, be := range objsToFilter.Entries {
+			if oname := strings.TrimPrefix(be.Name, prefetchPrefix); oname != be.Name {
+				s := re.FindStringSubmatch(oname)
+				if s == nil {
+					continue
+				}
+				if i, err := strconv.ParseInt(s[0], 10, 64); err != nil && s[0] != "" {
+					continue
+				} else if s[0] == "" || (rmin == 0 && rmax == 0) || (i >= rmin && i <= rmax) {
+					files = append(files, be.Name)
+				}
 			}
 		}
 	}
@@ -803,11 +816,16 @@ func createLocalBucket(httpclient *http.Client, t *testing.T, bucket string) {
 
 func destroyLocalBucket(httpclient *http.Client, t *testing.T, bucket string) {
 	var (
-		req *http.Request
-		r   *http.Response
-		err error
+		req    *http.Request
+		r      *http.Response
+		injson []byte
+		err    error
 	)
-	req, err = http.NewRequest("DELETE", proxyurl+"/v1/files/"+bucket, nil)
+	injson, err = json.Marshal(DeleteLocalBucketMsg)
+	if err != nil {
+		t.Fatalf("Failed to marshal CreateLocalBucketMsg: %v", err)
+	}
+	req, err = http.NewRequest("DELETE", proxyurl+"/v1/files/"+bucket, bytes.NewBuffer(injson))
 	if err != nil {
 		t.Fatalf("Failed to create request: %v", err)
 	}

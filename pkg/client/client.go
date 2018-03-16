@@ -8,8 +8,6 @@ package client
 import (
 	"bufio"
 	"bytes"
-	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,7 +16,6 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -41,6 +38,15 @@ var (
 type reqError struct {
 	code    int
 	message string
+}
+
+// Reader is the interface a client works with to read in data and send to a HTTP server
+type Reader interface {
+	io.ReadCloser
+	io.Seeker
+	Open() (io.ReadCloser, error)
+	XXHash() string
+	Description() string
 }
 
 type bytesReaderCloser struct {
@@ -142,79 +148,6 @@ func Get(proxyurl, bucket string, keyname string, wg *sync.WaitGroup, errch chan
 	return err
 }
 
-func Put(proxyurl, fname, bucket, keyname, xxhashstr string, fbuffer *bytes.Buffer,
-	wg *sync.WaitGroup, errch chan error, silent bool) (err error) {
-	var (
-		reader *bytesReaderCloser
-		req    *http.Request
-		file   *os.File
-	)
-	if wg != nil {
-		defer wg.Done()
-	}
-	puturl := proxyurl + "/v1/files/" + bucket + "/" + keyname
-	if !silent {
-		if xxhashstr == "" {
-			fmt.Printf("PUT: object %s/%s - %s\n", bucket, keyname, fname)
-		} else {
-			fmt.Printf("PUT: object %s/%s xxhash %s...\n", bucket, keyname, xxhashstr[:8])
-		}
-	}
-	if fbuffer == nil {
-		file, err = os.Open(fname)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to open file %s, err: %v", fname, err)
-			if errch != nil {
-				errch <- fmt.Errorf("Failed to open file %s, err: %v", fname, err)
-			}
-			return
-		}
-		defer file.Close()
-		req, err = http.NewRequest(http.MethodPut, puturl, file)
-	} else {
-		reader = &bytesReaderCloser{*bytes.NewReader(fbuffer.Bytes())}
-		req, err = http.NewRequest(http.MethodPut, puturl, fbuffer)
-	}
-	if err != nil {
-		if errch != nil {
-			errch <- fmt.Errorf("Failed to create new http request, err: %v", err)
-		}
-		return
-	}
-	// The HTTP package doesn't automatically set this for files, so it has to be done manually
-	// If it wasn't set, we would need to deal with the redirect manually.
-	req.GetBody = func() (io.ReadCloser, error) {
-		if fbuffer == nil {
-			return os.Open(fname)
-		}
-		return reader, nil
-	}
-	if xxhashstr != "" {
-		req.Header.Set(dfc.HeaderDfcChecksumType, dfc.ChecksumXXHash)
-		req.Header.Set(dfc.HeaderDfcChecksumVal, xxhashstr)
-	}
-	if fbuffer == nil {
-		_, err = file.Seek(0, 0)
-		if err != nil {
-			if errch != nil {
-				errch <- fmt.Errorf("Failed to seek file %s, err: %v", fname, err)
-			}
-			return
-		}
-	} else {
-		reader.Seek(0, 0)
-	}
-	r, err := httpclient.Do(req)
-	defer func() {
-		if r != nil {
-			r.Body.Close()
-		}
-	}()
-	err = discardResponse(r, err, "PUT")
-	emitError(r, err, errch)
-	return err
-}
-
 func Del(proxyurl, bucket string, keyname string, wg *sync.WaitGroup, errch chan error, silent bool) (err error) {
 	if wg != nil {
 		defer wg.Done()
@@ -226,14 +159,14 @@ func Del(proxyurl, bucket string, keyname string, wg *sync.WaitGroup, errch chan
 	}
 	req, httperr := http.NewRequest(http.MethodDelete, delurl, nil)
 	if httperr != nil {
-		err = fmt.Errorf("Failed to create new http request, err: %v", err)
+		err = fmt.Errorf("Failed to create new http request, err: %v", httperr)
 		emitError(nil, err, errch)
 		return err
 	}
 
 	r, httperr := httpclient.Do(req)
 	if httperr != nil {
-		err = fmt.Errorf("Failed to delete file, err: %v", err)
+		err = fmt.Errorf("Failed to delete file, err: %v", httperr)
 		emitError(nil, err, errch)
 		return err
 	}
@@ -386,65 +319,6 @@ func FastRandomFilename(src *rand.Rand, fnlen int) string {
 	return string(b)
 }
 
-func WriteRandomFil(fname string, bytes []byte, filesize int, blocksize int, random *rand.Rand) (tot int, xxhashstr string, err error) {
-	f, err := os.OpenFile(fname, os.O_WRONLY|os.O_CREATE, 0666) //wr-wr-wr-
-	xx := xxhash.New64()
-	if err != nil {
-		return
-	}
-	nblocks := filesize / blocksize
-	var r, n int
-	for i := 0; i <= nblocks; i++ {
-		if blocksize < filesize-tot {
-			r = blocksize
-		} else {
-			r = filesize - tot
-		}
-		random.Read(bytes[0:r])
-		n, err = f.Write(bytes[0:r])
-		if err != nil {
-			return
-		}
-		if n < r {
-			err = io.ErrShortWrite
-			return
-		}
-		xx.Write(bytes[0:r])
-		tot += n
-	}
-	hashIn64 := xx.Sum64()
-	hashInBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(hashInBytes, uint64(hashIn64))
-	xxhashstr = hex.EncodeToString(hashInBytes)
-	err = f.Close()
-	return
-}
-
-func WriteRandomMem(rbuf []byte, filesize int, blocksize int, random *rand.Rand, fbuffer *bytes.Buffer) (tot int, xxhashstr string, err error) {
-	var r, n int
-	xx := xxhash.New64()
-	nblocks := filesize / blocksize
-	for i := 0; i <= nblocks; i++ {
-		if blocksize < filesize-tot {
-			r = blocksize
-		} else {
-			r = filesize - tot
-		}
-		random.Read(rbuf[0:r])
-		n, err = fbuffer.Write(rbuf[0:r])
-		if err != nil {
-			return
-		}
-		xx.Write(rbuf[0:r])
-		tot += n
-	}
-	hashIn64 := xx.Sum64()
-	hashInBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(hashInBytes, uint64(hashIn64))
-	xxhashstr = hex.EncodeToString(hashInBytes)
-	return
-}
-
 func HeadBucket(proxyurl, bucket string) (server string, err error) {
 	var (
 		url = proxyurl + "/v1/files/" + bucket
@@ -463,4 +337,78 @@ func HeadBucket(proxyurl, bucket string) (server string, err error) {
 	}
 	server = r.Header.Get("Server")
 	return
+}
+
+func checkHTTPStatus(resp *http.Response, op string) error {
+	if resp.StatusCode >= http.StatusBadRequest {
+		return reqError{
+			code:    resp.StatusCode,
+			message: fmt.Sprintf("Bad status code from %s", op),
+		}
+	}
+
+	return nil
+}
+
+func discardHTTPResp(resp *http.Response) {
+	bufreader := bufio.NewReader(resp.Body)
+	dfc.ReadToNull(bufreader)
+}
+
+// Put sends a PUT request to the given URL
+func Put(proxyURL string, reader Reader, bucket string, key string, silent bool) error {
+	url := proxyURL + "/v1/files/" + bucket + "/" + key
+
+	if !silent {
+		fmt.Printf("PUT: object %s/%s - %s\n", bucket, key, reader.Description())
+	}
+
+	handle, err := reader.Open()
+	if err != nil {
+		return fmt.Errorf("Failed to open reader, err: %v", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPut, url, handle)
+	if err != nil {
+		return fmt.Errorf("Failed to create new http request, err: %v", err)
+	}
+
+	// The HTTP package doesn't automatically set this for files, so it has to be done manually
+	// If it wasn't set, we would need to deal with the redirect manually.
+	req.GetBody = func() (io.ReadCloser, error) {
+		return reader.Open()
+	}
+
+	if reader.XXHash() != "" {
+		req.Header.Set(dfc.HeaderDfcChecksumType, dfc.ChecksumXXHash)
+		req.Header.Set(dfc.HeaderDfcChecksumVal, reader.XXHash())
+	}
+
+	_, err = reader.Seek(0, 0)
+	if err != nil {
+		return fmt.Errorf("Failed to seek %s, err: %v", reader.Description(), err)
+	}
+
+	resp, err := httpclient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	err = checkHTTPStatus(resp, "PUT")
+	discardHTTPResp(resp)
+	return err
+}
+
+// PutAsync sends a PUT request to the given URL
+func PutAsync(wg *sync.WaitGroup, proxyURL string, reader Reader, bucket string, key string, errch chan error, silent bool) {
+	defer wg.Done()
+	err := Put(proxyURL, reader, bucket, key, silent)
+	if err != nil {
+		if errch == nil {
+			fmt.Println("Error channel is not given, do know how to report error", err)
+		} else {
+			errch <- err
+		}
+	}
 }

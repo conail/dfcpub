@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -25,6 +26,10 @@ import (
 	"github.com/golang/glog"
 )
 
+const (
+	cachedPageSize = 10000 // the number of cached file infos returned in one page
+)
+
 type mountPath struct {
 	Path string
 	Fsid syscall.Fsid
@@ -32,10 +37,25 @@ type mountPath struct {
 type fipair struct {
 	relname string
 	os.FileInfo
+	atime time.Time
 }
 type allfinfos struct {
 	finfos     []fipair
 	rootLength int
+}
+
+type cachedInfos struct {
+	files        []*BucketEntry
+	fileCount    int
+	rootLength   int
+	prefix       string
+	marker       string
+	markerDirs   []string
+	needAtime    bool
+	msg          *GetMsg
+	lastFilePath string
+	t            *targetrunner
+	bucket       string
 }
 
 //===========================================================================
@@ -52,9 +72,6 @@ type targetrunner struct {
 	starttime     time.Time
 	lbmap         *lbmap
 	rtnamemap     *rtnamemap
-	buffers       *buffers // 128K default
-	buffers32k    *buffers // 32K
-	buffers4k     *buffers // 4K
 	prefetchQueue chan filesWithDeadline
 }
 
@@ -66,9 +83,6 @@ func (t *targetrunner) run() error {
 	t.xactinp = newxactinp()                         // extended actions
 	t.lbmap = &lbmap{LBmap: make(map[string]string)} // local (cache-only) buckets
 	t.rtnamemap = newrtnamemap(128)                  // lock/unlock name
-	t.buffers = newbuffers(128 * 1024)
-	t.buffers32k = newbuffers(32 * 1024)
-	t.buffers4k = newbuffers(4 * 1024)
 
 	if status, err := t.register(false); err != nil {
 		glog.Errorf("Target %s failed to register with proxy, err: %v", t.si.DaemonID, err)
@@ -287,22 +301,14 @@ func (t *targetrunner) httpfilget(w http.ResponseWriter, r *http.Request) {
 		w.Header().Add(HeaderDfcChecksumType, htype)
 		w.Header().Add(HeaderDfcChecksumVal, hval)
 	}
-	// buffer pooling
-	var buffs buffif
-	if size > t.buffers32k.fixedsize {
-		buffs = t.buffers
-	} else if size > t.buffers4k.fixedsize {
-		buffs = t.buffers32k
-	} else {
-		if size == 0 {
-			errstr = fmt.Sprintf("Unexpected: object %s/%s size is zero", bucket, objname)
-			t.invalmsghdlr(w, r, errstr)
-			return // likely, an error
-		}
-		buffs = t.buffers4k
+	if size == 0 {
+		errstr = fmt.Sprintf("Unexpected: object %s/%s size is zero", bucket, objname)
+		t.invalmsghdlr(w, r, errstr)
+		return // likely, an error
 	}
-	buf := buffs.alloc()
-	defer buffs.free(buf)
+	slab := selectslab(size)
+	buf := slab.alloc()
+	defer slab.free(buf)
 	// copy
 	written, err := io.CopyBuffer(w, file, buf)
 	if err != nil {
@@ -386,33 +392,65 @@ func (t *targetrunner) pushhdlr(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("Pushed Object List "))
 }
 
-func (t *targetrunner) listbucket(w http.ResponseWriter, r *http.Request, bucket string) {
+// should not be called for local buckets
+func (t *targetrunner) listCachedObjects(bucket string, msg *GetMsg) (outbytes []byte, errstr string, errcode int) {
+	var err error
 
-	islocal, errstr, errcode := t.checkLocalQueryParameter(bucket, r)
-	if errstr != "" {
-		t.invalmsghdlr(w, r, errstr, errcode)
+	if t.islocalBucket(bucket) {
+		return nil, fmt.Sprintf("Cache is unavailable for local bucket %s", bucket), 0
 	}
 
-	msg := &GetMsg{}
-	if t.readJSON(w, r, msg) != nil {
-		return
+	needAtime := strings.Contains(msg.GetProps, GetPropsAtime)
+	// Split a marker into separate directory list to make pagination
+	// more effective. All directories in the list are skipped by
+	// filepath.Walk. The last directory of the marker must be excluded
+	// from the list because the marker can point to the middle of it
+	markerDirs := make([]string, 0)
+	if msg.GetPageMarker != "" && strings.Contains(msg.GetPageMarker, "/") {
+		idx := strings.LastIndex(msg.GetPageMarker, "/")
+		markerDirs = strings.Split(msg.GetPageMarker[:idx], "/")
+		markerDirs = markerDirs[:len(markerDirs)-1]
 	}
-	if !islocal {
-		jsbytes, errstr, errcode := getcloudif().listbucket(bucket, msg)
-		if errstr != "" {
-			if errcode == 0 {
-				t.invalmsghdlr(w, r, errstr)
-			} else {
-				t.invalmsghdlr(w, r, errstr, errcode)
-			}
-		} else {
-			if errstr := t.writeJSON(w, r, jsbytes, "listbucket"); errstr == "" {
-				t.statsif.add("numlist", 1)
-			}
+	allfinfos := cachedInfos{make([]*BucketEntry, 0, cachedPageSize), 0, 0, msg.GetPrefix, msg.GetPageMarker, markerDirs, needAtime, msg, "", t, bucket}
+
+	// We need stable order of mountpaths
+	mpathList := make([]string, 0, len(ctx.mountpaths))
+	for mpath := range ctx.mountpaths {
+		mpathList = append(mpathList, mpath)
+	}
+	sort.Strings(mpathList)
+
+	for _, mpath := range mpathList {
+		localbucketfqn := mpath + "/" + ctx.config.CloudBuckets + "/" + bucket
+		_, err = os.Stat(localbucketfqn)
+		if err != nil {
+			continue
 		}
-		return
+
+		allfinfos.rootLength = len(localbucketfqn) + 1 // +1 for separator between bucket and filename
+		if err = filepath.Walk(localbucketfqn, allfinfos.listwalkf); err != nil {
+			errstr = fmt.Sprintf("Failed to traverse mpath %q, err: %v", mpath, err)
+			glog.Errorf(errstr)
+		}
 	}
-	// local bucket
+
+	if err == nil {
+		var reslist = BucketList{Entries: allfinfos.files}
+		// Mark the batch as truncated if it is full
+		if len(allfinfos.files) >= cachedPageSize {
+			reslist.PageMarker = allfinfos.lastFilePath
+		}
+		outbytes, err = json.Marshal(reslist)
+	}
+	if err != nil {
+		errstr = fmt.Sprintf("Failed to traverse cached objects: %v", err.Error())
+		glog.Errorf(errstr)
+	}
+
+	return
+}
+
+func (t *targetrunner) doLocalBucketList(w http.ResponseWriter, r *http.Request, bucket string, msg *GetMsg) {
 	allfinfos := allfinfos{make([]fipair, 0, 128), 0}
 	for mpath := range ctx.mountpaths {
 		localbucketfqn := mpath + "/" + ctx.config.LocalBuckets + "/" + bucket
@@ -421,6 +459,7 @@ func (t *targetrunner) listbucket(w http.ResponseWriter, r *http.Request, bucket
 			glog.Errorf("Failed to traverse mpath %q, err: %v", mpath, err)
 		}
 	}
+
 	t.statsif.add("numlist", 1)
 	var reslist = BucketList{Entries: make([]*BucketEntry, 0, len(allfinfos.finfos))}
 	for _, fi := range allfinfos.finfos {
@@ -448,16 +487,68 @@ func (t *targetrunner) listbucket(w http.ResponseWriter, r *http.Request, bucket
 		if strings.Contains(msg.GetProps, GetPropsChecksum) {
 			fqn := t.fqn(bucket, fi.relname)
 			xxhex, errstr := Getxattr(fqn, xattrXXHashVal)
-			// see xattrXXHashVal comment above
 			if errstr == "" {
 				entry.Checksum = hex.EncodeToString(xxhex)
 			}
 		}
-		// TODO: other GetMsg props TBD
+		if strings.Contains(msg.GetProps, GetPropsAtime) {
+			if msg.GetTimeFormat == "" {
+				entry.Atime = fi.atime.Format(RFC822)
+			} else {
+				entry.Atime = fi.atime.Format(msg.GetTimeFormat)
+			}
+		}
 		reslist.Entries = append(reslist.Entries, entry)
 	}
 	jsbytes, err := json.Marshal(reslist)
 	assert(err == nil, err)
+	_ = t.writeJSON(w, r, jsbytes, "listbucket")
+}
+
+func (t *targetrunner) listbucket(w http.ResponseWriter, r *http.Request, bucket string) {
+	var (
+		jsbytes []byte
+		errstr  string
+		errcode int
+	)
+	islocal, errstr, errcode := t.checkLocalQueryParameter(bucket, r)
+	if errstr != "" {
+		t.invalmsghdlr(w, r, errstr, errcode)
+	}
+	useCache, errstr, errcode := t.checkCacheQueryParameter(r)
+	if errstr != "" {
+		t.invalmsghdlr(w, r, errstr, errcode)
+	}
+
+	msg := &GetMsg{}
+	if t.readJSON(w, r, msg) != nil {
+		return
+	}
+
+	if islocal {
+		t.doLocalBucketList(w, r, bucket, msg)
+		return
+	}
+
+	if useCache {
+		// Read local cached file infos
+		// It is internal call, that is why numlist of stats is not incremented
+		jsbytes, errstr, errcode = t.listCachedObjects(bucket, msg)
+	} else {
+		// do cloud request
+		if jsbytes, errstr, errcode = getcloudif().listbucket(bucket, msg); errstr == "" {
+			t.statsif.add("numlist", 1)
+		}
+	}
+
+	if errstr != "" {
+		if errcode == 0 {
+			t.invalmsghdlr(w, r, errstr)
+		} else {
+			t.invalmsghdlr(w, r, errstr, errcode)
+		}
+	}
+
 	_ = t.writeJSON(w, r, jsbytes, "listbucket")
 }
 
@@ -471,23 +562,105 @@ func (all *allfinfos) listwalkf(fqn string, osfi os.FileInfo, err error) error {
 		return nil
 	}
 	relname := fqn[all.rootLength:]
-	all.finfos = append(all.finfos, fipair{relname, osfi})
+	atime, _, _ := get_amtimes(osfi)
+	all.finfos = append(all.finfos, fipair{relname, osfi, atime})
 	return nil
 }
 
+func (ci *cachedInfos) processDir(fqn string) error {
+	if len(fqn) <= ci.rootLength {
+		return nil
+	}
+
+	relname := fqn[ci.rootLength:]
+	if ci.prefix != "" && !strings.HasPrefix(ci.prefix, relname) {
+		return filepath.SkipDir
+	}
+
+	if len(ci.markerDirs) != 0 {
+		dirs := strings.Split(fqn, "/")
+		maxIdx := len(dirs)
+		if len(ci.markerDirs) < maxIdx {
+			maxIdx = len(ci.markerDirs)
+		}
+		for idx := 0; idx < maxIdx; idx++ {
+			if dirs[idx] < ci.markerDirs[idx] {
+				return filepath.SkipDir
+			}
+		}
+	}
+
+	return nil
+}
+
+func (ci *cachedInfos) processRegularFile(fqn string, osfi os.FileInfo) error {
+	relname := fqn[ci.rootLength:]
+	if ci.prefix != "" && !strings.HasPrefix(relname, ci.prefix) {
+		return nil
+	}
+
+	if ci.marker != "" && fqn <= ci.marker {
+		return nil
+	}
+
+	if hrwTarget(ci.bucket+"/"+relname, ci.t.smap).DaemonID != ci.t.si.DaemonID {
+		// this target is not responsible for returning this object
+		return nil
+	}
+
+	// the file passed all checks - add it to the batch
+	ci.fileCount++
+	fileInfo := &BucketEntry{Name: relname, Atime: "", IsCached: true}
+	if ci.needAtime {
+		atime, _, _ := get_amtimes(osfi)
+		if ci.msg.GetTimeFormat == "" {
+			fileInfo.Atime = atime.Format(RFC822)
+		} else {
+			fileInfo.Atime = atime.Format(ci.msg.GetTimeFormat)
+		}
+	}
+	ci.files = append(ci.files, fileInfo)
+	ci.lastFilePath = fqn
+	return nil
+}
+
+func (ci *cachedInfos) listwalkf(fqn string, osfi os.FileInfo, err error) error {
+	if err != nil {
+		glog.Errorf("listwalkf callback invoked with err: %v", err)
+		return err
+	}
+
+	if ci.fileCount >= cachedPageSize {
+		return filepath.SkipDir
+	}
+
+	if osfi.IsDir() {
+		return ci.processDir(fqn)
+	}
+
+	return ci.processRegularFile(fqn, osfi)
+}
+
 func (t *targetrunner) httpfilput(w http.ResponseWriter, r *http.Request) {
-	apitems := t.restAPIItems(r.URL.Path, 9)
-	if len(apitems) > 4 && apitems[2] == Rfrom || apitems[4] == Rto {
-		//
-		// Rebalance: "/"+Rversion+"/"+Rfiles+"/"+"from_id"+"/"+ID+"to_id"+"/"+bucket+"/"+objname
-		//
-		if apitems = t.checkRestAPI(w, r, apitems, 6, Rversion, Rfiles); apitems == nil {
-			return
+	apitems := t.restAPIItems(r.URL.Path, 5)
+	if apitems = t.checkRestAPI(w, r, apitems, 1, Rversion, Rfiles); apitems == nil {
+		fmt.Println("Problem in put with URL " + r.URL.Path)
+		return
+	}
+	query := r.URL.Query()
+
+	from, to, bucket, objname := query.Get(ParamFromID), query.Get(ParamToID), apitems[0], ""
+	if len(apitems) > 1 {
+		objname = strings.Join(apitems[1:], "/")
+	}
+	if from != "" && to != "" {
+		// Rebalance: "/"+Rversion+"/"+Rfiles + "/"+bucket+"/"+objname+"?from_id="+from_id+"&to_id="+to_id
+
+		if objname == "" {
+			s := "Invalid URL: missing object name to copy"
+			t.invalmsghdlr(w, r, s)
 		}
-		from, to, bucket, objname := apitems[1], apitems[3], apitems[4], apitems[5]
-		if len(apitems) > 6 {
-			objname = strings.Join(apitems[5:], "/")
-		}
+
 		size, errstr := t.dorebalance(r, from, to, bucket, objname)
 		if errstr != "" {
 			t.invalmsghdlr(w, r, errstr)
@@ -497,13 +670,7 @@ func (t *targetrunner) httpfilput(w http.ResponseWriter, r *http.Request) {
 		t.statsif.add("numrecvbytes", size)
 	} else {
 		// PUT: "/"+Rversion+"/"+Rfiles+"/"+bucket+"/"+objname
-		if apitems = t.checkRestAPI(w, r, apitems, 1, Rversion, Rfiles); apitems == nil {
-			return
-		}
-		bucket, objname := apitems[0], ""
-		if len(apitems) > 1 {
-			objname = strings.Join(apitems[1:], "/")
-		}
+
 		errstr, errcode := t.doput(w, r, bucket, objname)
 		if errstr != "" {
 			if errcode == 0 {
@@ -541,9 +708,10 @@ func (t *targetrunner) doput(w http.ResponseWriter, r *http.Request, bucket stri
 	// optimize out if the checksums do match
 	if hdhobj != nil && cksumcfg.Checksum != ChecksumNone {
 		file, err := os.Open(fqn)
-		// File exists in local cache.
+		// exists - compute checksum and compare with the caller's
 		if err == nil {
-			buf := t.buffers.alloc()
+			slab := selectslab(0) // unknown size
+			buf := slab.alloc()
 			if htype == ChecksumXXHash {
 				xx := xxhash.New64()
 				hash, errstr = ComputeXXHash(file, buf, xx)
@@ -554,7 +722,7 @@ func (t *targetrunner) doput(w http.ResponseWriter, r *http.Request, bucket stri
 			if errstr != "" {
 				glog.Warningf("Could not compute or invalid hash for %s  errstr: %v", fqn, errstr)
 			}
-			t.buffers.free(buf)
+			slab.free(buf)
 			// not a critical error
 			if err = file.Close(); err != nil {
 				glog.Warningf("Unexpected failure to close %s once xxhash-ed, err: %v", fqn, err)
@@ -821,16 +989,18 @@ func (t *targetrunner) sendfile(method, bucket, objname string, destsi *daemonIn
 	var (
 		hash   string
 		errstr string
-		buffs  buffif
 	)
+	if size == 0 {
+		return fmt.Sprintf("Unexpected: %s/%s size is zero", bucket, objname)
+	}
 	cksumcfg := &ctx.config.CksumConfig
 	if newobjname == "" {
 		newobjname = objname
 	}
 	fromid, toid := t.si.DaemonID, destsi.DaemonID // source=self and destination
 	url := destsi.DirectURL + "/" + Rversion + "/" + Rfiles + "/"
-	url += Rfrom + "/" + fromid + "/" + Rto + "/" + toid + "/"
 	url += bucket + "/" + newobjname
+	url += fmt.Sprintf("?%s=%s&%s=%s", ParamFromID, fromid, ParamToID, toid)
 
 	fqn := t.fqn(bucket, objname)
 	file, err := os.Open(fqn)
@@ -839,23 +1009,16 @@ func (t *targetrunner) sendfile(method, bucket, objname string, destsi *daemonIn
 	}
 	defer file.Close()
 
-	if size > t.buffers32k.fixedsize {
-		buffs = t.buffers
-	} else if size > t.buffers4k.fixedsize {
-		buffs = t.buffers32k
-	} else {
-		assert(size != 0, "Unexpected: zero size "+fqn)
-		buffs = t.buffers4k
-	}
+	slab := selectslab(size)
 	if cksumcfg.Checksum != ChecksumNone {
 		assert(cksumcfg.Checksum == ChecksumXXHash)
-		buf := buffs.alloc()
+		buf := slab.alloc()
 		xx := xxhash.New64()
 		if hash, errstr = ComputeXXHash(file, buf, xx); errstr != "" {
-			buffs.free(buf)
+			slab.free(buf)
 			return errstr
 		}
-		buffs.free(buf)
+		slab.free(buf)
 	}
 	_, err = file.Seek(0, 0)
 	if err != nil {
@@ -928,6 +1091,18 @@ func (t *targetrunner) httpfilhead(w http.ResponseWriter, r *http.Request) {
 	for k, v := range headers {
 		w.Header().Add(k, v)
 	}
+}
+
+func (t *targetrunner) checkCacheQueryParameter(r *http.Request) (useCache bool, errstr string, errcode int) {
+	useCacheStr := r.URL.Query().Get(ParamCached)
+	if useCacheStr != "" && useCacheStr != "true" && useCacheStr != "false" {
+		errstr = fmt.Sprintf("Invalid parameter: \"%s=%s\". Must be [\"\",\"true\",\"false\"]", ParamCached, useCacheStr)
+		errcode = http.StatusInternalServerError
+		return
+	}
+
+	useCache = useCacheStr == "true"
+	return
 }
 
 func (t *targetrunner) checkLocalQueryParameter(bucket string, r *http.Request) (islocal bool, errstr string, errcode int) {
@@ -1351,9 +1526,10 @@ func (t *targetrunner) receiveFileAndFinalize(fqn, objname, omd5 string, ohobj c
 		errstr = fmt.Sprintf("Failed to create and initialize %s, err: %s", fqn, errstr)
 		return
 	}
-	buf := t.buffers.alloc()
+	slab := selectslab(0)
+	buf := slab.alloc()
 	defer func() {
-		t.buffers.free(buf)
+		slab.free(buf)
 		if errstr == "" {
 			return
 		}
@@ -1382,7 +1558,7 @@ func (t *targetrunner) receiveFileAndFinalize(fqn, objname, omd5 string, ohobj c
 			ohtype, ohval = ohobj.get()
 			assert(ohtype == ChecksumXXHash)
 			if ohval != nhval {
-				errstr = fmt.Sprintf("Checksum mismatch: object %s XXHASH %s... != received file %s XXHASH %s...)",
+				errstr = fmt.Sprintf("Checksum mismatch: object %s xxhash %s... != received file %s xxhash %s...)",
 					objname, ohval, fqn, nhval)
 				return
 			}

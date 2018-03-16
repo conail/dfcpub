@@ -1,7 +1,10 @@
+/*
+ * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
+ *
+ */
 package dfc_test
 
 import (
-	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -9,6 +12,8 @@ import (
 	"os"
 	"sync"
 	"testing"
+
+	"github.com/NVIDIA/dfcpub/pkg/client/readers"
 
 	"github.com/NVIDIA/dfcpub/dfc"
 	"github.com/NVIDIA/dfcpub/pkg/client"
@@ -39,7 +44,7 @@ func init() {
 }
 
 func Test_smoke(t *testing.T) {
-	flag.Parse()
+	parse()
 
 	if err := client.Tcping(proxyurl); err != nil {
 		tlogf("%s: %v\n", proxyurl, err)
@@ -49,14 +54,9 @@ func Test_smoke(t *testing.T) {
 	if err := dfc.CreateDir(LocalDestDir); err != nil {
 		t.Fatalf("Failed to create dir %s, err: %v", LocalDestDir, err)
 	}
+
 	if err := dfc.CreateDir(SmokeDir); err != nil {
 		t.Fatalf("Failed to create dir %s, err: %v", SmokeDir, err)
-	}
-	if inmem {
-		megabytes, _ := dfc.TotalMemory()
-		if megabytes < PhysMemSizeWarn {
-			fmt.Fprintf(os.Stderr, "Warning: host memory size = %dMB may be insufficient, consider -inmem=false\n", megabytes)
-		}
 	}
 
 	fp := make(chan string, len(filesizes)*len(ratios)*numops*numworkers)
@@ -67,12 +67,14 @@ func Test_smoke(t *testing.T) {
 			bs += int64(numworkers + 1)
 		}
 	}
+
 	close(fp)
-	//clean up all the files from the test
+
+	// Clean up all the files from the test
 	wg := &sync.WaitGroup{}
 	errch := make(chan error, len(filesizes)*len(ratios)*numops*numworkers)
 	for file := range fp {
-		if !inmem {
+		if usingFile {
 			err := os.Remove(SmokeDir + "/" + file)
 			if err != nil {
 				t.Error(err)
@@ -97,23 +99,41 @@ func oneSmoke(t *testing.T, filesize int, ratio float32, bseed int64, filesput c
 	var (
 		nGet = int(float32(numworkers) * ratio)
 		nPut = numworkers - nGet
+		sgls = make([]*dfc.SGLIO, numworkers, numworkers)
 	)
+
 	// Get the workers started
+	if usingSG {
+		for i := 0; i < numworkers; i++ {
+			sgls[i] = dfc.NewSGLIO(uint64(filesize))
+		}
+		defer func() {
+			for _, sgl := range sgls {
+				sgl.Free()
+			}
+		}()
+	}
+
 	for i := 0; i < numworkers; i++ {
-		wg.Add(1)
 		if (i%2 == 0 && nPut > 0) || nGet == 0 {
+			wg.Add(1)
 			go func(i int) {
-				var fbuffer *bytes.Buffer
-				if inmem {
-					fbuf := make([]byte, filesize)
-					fbuffer = bytes.NewBuffer(fbuf)
+				var sgl *dfc.SGLIO
+				if usingSG {
+					sgl = sgls[i]
 				}
-				putRandomFiles(i, bseed+int64(i), uint64(filesize), numops, clibucket, t, wg, errch, filesput,
-					SmokeDir, smokestr, "", false, fbuffer)
+
+				putRandomFiles(i, bseed+int64(i), uint64(filesize), numops, clibucket, t, nil, errch, filesput,
+					SmokeDir, smokestr, "", false, sgl)
+				wg.Done()
 			}(i)
 			nPut--
 		} else {
-			go func(i int) { getRandomFiles(i, bseed+int64(i), numops, clibucket, t, wg, errch) }(i)
+			wg.Add(1)
+			go func(i int) {
+				getRandomFiles(i, bseed+int64(i), numops, clibucket, t, nil, errch)
+				wg.Done()
+			}(i)
 			nGet--
 		}
 	}
@@ -170,29 +190,37 @@ func getRandomFiles(id int, seed int64, numGets int, bucket string, t *testing.T
 
 func putRandomFiles(id int, seed int64, fileSize uint64, numPuts int, bucket string,
 	t *testing.T, wg *sync.WaitGroup, errch chan error, filesput chan string,
-	dir, keystr, htype string, silent bool, fbuffer *bytes.Buffer) {
-	var (
-		err       error
-		xxhashstr string
-	)
+	dir, keystr, htype string, silent bool, sgl *dfc.SGLIO) {
 	if wg != nil {
 		defer wg.Done()
 	}
+
 	src := rand.NewSource(seed)
 	random := rand.New(src)
-	buffer := make([]byte, blocksize)
 	for i := 0; i < numPuts; i++ {
 		fname := client.FastRandomFilename(random, fnlen)
 		size := fileSize
 		if size == 0 {
 			size = uint64(random.Intn(1024)+1) * 1024
 		}
-		if fbuffer != nil {
-			fbuffer.Reset()
-			_, xxhashstr, err = client.WriteRandomMem(buffer, int(size), blocksize, random, fbuffer)
+
+		var (
+			r   client.Reader
+			err error
+		)
+		if sgl != nil {
+			sgl.Reset()
+			r, err = readers.NewSGReader(sgl, int64(size), true /* with Hash */)
 		} else {
-			_, xxhashstr, err = client.WriteRandomFil(dir+"/"+fname, buffer, int(size), blocksize, random)
+			r, err = readers.NewReader(readers.ParamReader{
+				Type: readerType,
+				SGL:  nil,
+				Path: dir,
+				Name: fname,
+				Size: int64(size),
+			})
 		}
+
 		if err != nil {
 			t.Error(err)
 			fmt.Fprintf(os.Stderr, "Failed to generate random file %s, err: %v\n", dir+"/"+fname, err)
@@ -201,10 +229,17 @@ func putRandomFiles(id int, seed int64, fileSize uint64, numPuts int, bucket str
 			}
 			return
 		}
+
 		// We could PUT while creating files, but that makes it
 		// begin all the puts immediately (because creating random files is fast
 		// compared to the listbucket call that getRandomFiles does)
-		client.Put(proxyurl, dir+"/"+fname, bucket, keystr+"/"+fname, xxhashstr, fbuffer, nil, errch, silent)
+		err = client.Put(proxyurl, r, bucket, keystr+"/"+fname, silent)
+		if err != nil {
+			if errch == nil {
+				fmt.Println("Error channel is nil, do not know how to report error")
+			}
+			errch <- err
+		}
 		filesput <- fname
 	}
 }
