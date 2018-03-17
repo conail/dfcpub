@@ -105,20 +105,20 @@ func CreateDir(dirname string) (err error) {
 	return
 }
 
-// NOTE: receives, flushes, and closes
-func ReceiveFile(file *os.File, rrbody io.Reader, buf []byte, hashes ...hash.Hash) (written int64, errstr string) {
+func ReceiveAndChecksum(filewriter io.Writer, rrbody io.Reader,
+	buf []byte, hashes ...hash.Hash) (written int64, errstr string) {
 	var (
 		writer io.Writer
 		err    error
 	)
 	if len(hashes) == 0 {
-		writer = file
+		writer = filewriter
 	} else {
 		hashwriters := make([]io.Writer, len(hashes)+1)
 		for i, h := range hashes {
 			hashwriters[i] = h.(io.Writer)
 		}
-		hashwriters[len(hashes)] = file
+		hashwriters[len(hashes)] = filewriter
 		writer = io.MultiWriter(hashwriters...)
 	}
 	if buf == nil {
@@ -210,7 +210,11 @@ type cksumvalmd5 struct {
 }
 
 func newcksumvalue(kind string, val string) cksumvalue {
-	if kind == "" || val == "" {
+	if kind == "" {
+		return nil
+	}
+	if val == "" {
+		glog.Infof("Warning: checksum %s: empty value", kind)
 		return nil
 	}
 	if kind == ChecksumXXHash {
@@ -286,4 +290,17 @@ func IsErrConnectionRefused(err error) (yes bool) {
 		}
 	}
 	return
+}
+
+func isSyscallWriteError(err error) bool {
+	switch e := err.(type) {
+	case *url.Error:
+		return isSyscallWriteError(e.Err)
+	case *net.OpError:
+		return e.Op == "write" && isSyscallWriteError(e.Err)
+	case *os.SyscallError:
+		return e.Syscall == "write"
+	default:
+		return false
+	}
 }

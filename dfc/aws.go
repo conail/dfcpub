@@ -199,7 +199,9 @@ func (awsimpl *awsimpl) getobj(fqn, bucket, objname string) (nhobj cksumvalue, s
 		}
 		md5 = ""
 	}
-	if nhobj, size, errstr = awsimpl.t.receiveFileAndFinalize(fqn, objname, md5, v, obj.Body); errstr != "" {
+	inmem := (ctx.config.AckPolicy.ColdGet == AckWhenInMem)
+	assert(!inmem, "niy")
+	if _, nhobj, size, errstr = awsimpl.t.receive(fqn, inmem, objname, md5, v, obj.Body); errstr != "" {
 		return
 	}
 	if glog.V(3) {

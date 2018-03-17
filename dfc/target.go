@@ -86,7 +86,7 @@ func (t *targetrunner) run() error {
 
 	if status, err := t.register(false); err != nil {
 		glog.Errorf("Target %s failed to register with proxy, err: %v", t.si.DaemonID, err)
-		if IsErrConnectionRefused(err) || status == http.StatusRequestTimeout { // AA: use status
+		if IsErrConnectionRefused(err) || status == http.StatusRequestTimeout {
 			glog.Errorf("Target %s: retrying registration...", t.si.DaemonID)
 			time.Sleep(time.Second * 3)
 			if _, err = t.register(false); err != nil {
@@ -356,7 +356,6 @@ func (t *targetrunner) pushhdlr(w http.ResponseWriter, r *http.Request) {
 		t.invalmsghdlr(w, r, s)
 		return
 	}
-
 	if pusher, ok := w.(http.Pusher); ok {
 		objnamebytes, err := ioutil.ReadAll(r.Body)
 		if err != nil {
@@ -370,7 +369,6 @@ func (t *targetrunner) pushhdlr(w http.ResponseWriter, r *http.Request) {
 			t.invalmsghdlr(w, r, s)
 			return
 		}
-
 		objnames := make([]string, 0)
 		err = json.Unmarshal(objnamebytes, &objnames)
 		if err != nil {
@@ -695,12 +693,14 @@ func (t *targetrunner) httpfilput(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (t *targetrunner) doput(w http.ResponseWriter, r *http.Request, bucket string, objname string) (errstr string, errcode int) {
+func (t *targetrunner) doput(w http.ResponseWriter, r *http.Request, bucket, objname string) (errstr string, errcode int) {
 	var (
-		err                      error
-		file                     *os.File
-		hdhobj, nhobj            cksumvalue
-		hash, htype, hval, nhval string
+		file                       *os.File
+		err                        error
+		hdhobj, nhobj              cksumvalue
+		xxhashval                  string
+		htype, hval, nhtype, nhval string
+		sgl                        *SGLIO
 	)
 	cksumcfg := &ctx.config.CksumConfig
 	fqn := t.fqn(bucket, objname)
@@ -711,10 +711,6 @@ func (t *targetrunner) doput(w http.ResponseWriter, r *http.Request, bucket stri
 	hdhobj = newcksumvalue(r.Header.Get(HeaderDfcChecksumType), r.Header.Get(HeaderDfcChecksumVal))
 	if hdhobj != nil {
 		htype, hval = hdhobj.get()
-		if htype == "" || hval == "" {
-			glog.Infof("Warning: empty %s: %s", HeaderDfcChecksumType, HeaderDfcChecksumVal)
-			htype, hval = "", ""
-		}
 	}
 	// optimize out if the checksums do match
 	if hdhobj != nil && cksumcfg.Checksum != ChecksumNone {
@@ -725,29 +721,71 @@ func (t *targetrunner) doput(w http.ResponseWriter, r *http.Request, bucket stri
 			buf := slab.alloc()
 			if htype == ChecksumXXHash {
 				xx := xxhash.New64()
-				hash, errstr = ComputeXXHash(file, buf, xx)
+				xxhashval, errstr = ComputeXXHash(file, buf, xx)
 			} else {
-				errstr = fmt.Sprintf("Unsupported hash type %s", htype)
+				errstr = fmt.Sprintf("Unsupported checksum type %s", htype)
 			}
 			// not a critical error
 			if errstr != "" {
-				glog.Warningf("Could not compute or invalid hash for %s  errstr: %v", fqn, errstr)
+				glog.Warningf("Warning: Bad checksum: %s: %v", fqn, errstr)
 			}
 			slab.free(buf)
 			// not a critical error
 			if err = file.Close(); err != nil {
 				glog.Warningf("Unexpected failure to close %s once xxhash-ed, err: %v", fqn, err)
 			}
-			if errstr == "" && hash == hval {
-				glog.Infof("Existing %s is valid: new PUT is a no-op", fqn)
+			if errstr == "" && xxhashval == hval {
+				glog.Infof("Existing %s is valid: PUT is a no-op", fqn)
 				return
 			}
 		}
 	}
-	if nhobj, _, errstr = t.receiveFileAndFinalize(putfqn, objname, "", hdhobj, r.Body); errstr != "" {
+	inmem := (ctx.config.AckPolicy.Put == AckWhenInMem)
+	if sgl, nhobj, _, errstr = t.receive(putfqn, inmem, objname, "", hdhobj, r.Body); errstr != "" {
 		return
 	}
-	// putfqn is received
+	if nhobj != nil {
+		nhtype, nhval = nhobj.get()
+		assert(hdhobj == nil || htype == nhtype)
+	}
+	// validate checksum when and if provided
+	if hval != "" && nhval != "" && hval != nhval {
+		errstr = fmt.Sprintf("Bad checksum: %s/%s %s %s... != %s...", bucket, objname, htype, hval[:8], nhval[:8])
+		return
+	}
+	// commit
+	if sgl == nil {
+		return t.putCloudRename(bucket, objname, putfqn, fqn, nhobj)
+	}
+	//
+	// FIXME: AA: hanbdle errors, use xaction
+	//
+	go func() {
+		file, err := os.Open(putfqn)
+		assert(err == nil, err)
+		glog.Infoln("inmem-open", putfqn)
+		slab := selectslab(sgl.Size())
+		buf := slab.alloc()
+		reader := NewReader(sgl)
+		written, err := io.CopyBuffer(file, reader, buf)
+		glog.Infoln("inmem-copied sgl=>", putfqn)
+		assert(err == nil, err)
+		assert(written == sgl.Size())
+		err = file.Close()
+		glog.Infoln("inmem-closed", putfqn)
+		assert(err == nil, err)
+		errstr, errcode = t.putCloudRename(bucket, objname, putfqn, fqn, nhobj)
+		assert(errstr == "", errstr)
+		glog.Infoln("inmem-committed", fqn)
+	}()
+	return
+}
+
+func (t *targetrunner) putCloudRename(bucket, objname, putfqn, fqn string, nhobj cksumvalue) (errstr string, errcode int) {
+	var (
+		file *os.File
+		err  error
+	)
 	defer func() {
 		if errstr != "" {
 			if err = os.Remove(putfqn); err != nil {
@@ -755,15 +793,7 @@ func (t *targetrunner) doput(w http.ResponseWriter, r *http.Request, bucket stri
 			}
 		}
 	}()
-	if nhobj != nil {
-		_, nhval = nhobj.get()
-	}
-	// hdhash may not be provided by client.
-	// hash may not have been computed due to DFC config settings.
-	if hval != "" && nhval != "" && hval != nhval {
-		errstr = fmt.Sprintf("Invalid checksum: %s hash %s... does not match user's %s...", fqn, nhval, hval)
-		return
-	}
+	// cloud
 	if !t.islocalBucket(bucket) {
 		if file, err = os.Open(putfqn); err != nil {
 			errstr = fmt.Sprintf("Failed to re-open %s err: %v", putfqn, err)
@@ -778,8 +808,11 @@ func (t *targetrunner) doput(w http.ResponseWriter, r *http.Request, bucket stri
 			glog.Errorf("Unexpected failure to close an already PUT file %s, err: %v", putfqn, err)
 		}
 	}
-	// serialize on the name - and rename
+	// when all set and done: lock the name, rename and set xattr
 	errstr = t.safeRename(bucket, objname, putfqn, fqn)
+	if errstr == "" {
+		errstr = finalizeobj(fqn, nhobj)
+	}
 	return
 }
 
@@ -833,7 +866,7 @@ func (t *targetrunner) dorebalance(r *http.Request, from, to, bucket, objname st
 		}
 	} else {
 		//
-		// the destination
+		// the destination - FIXME: AA: xxhash & validation
 		//
 		if glog.V(3) {
 			glog.Infof("Rebalance to %q: bucket %q objname %q <= from %q", to, bucket, objname, from)
@@ -844,9 +877,11 @@ func (t *targetrunner) dorebalance(r *http.Request, from, to, bucket, objname st
 			glog.Infof("File copy: %s already exists at the destination %s", fqn, t.si.DaemonID)
 			return // not an error, nothing to do
 		}
-		// write file with extended attributes .
-		var nhobj cksumvalue
-		if _, size, errstr = t.receiveFileAndFinalize(putfqn, objname, "", nhobj, r.Body); errstr != "" {
+		var (
+			hdhobj = newcksumvalue(r.Header.Get(HeaderDfcChecksumType), r.Header.Get(HeaderDfcChecksumVal))
+			inmem  = (ctx.config.AckPolicy.Put == AckWhenInMem)
+		)
+		if _, _, size, errstr = t.receive(putfqn, inmem, objname, "", hdhobj, r.Body); errstr != "" {
 			return
 		}
 		errstr = t.safeRename(bucket, objname, putfqn, fqn)
@@ -1074,8 +1109,8 @@ func (t *targetrunner) deletefiles(w http.ResponseWriter, r *http.Request, msg A
 
 func (t *targetrunner) sendfile(method, bucket, objname string, destsi *daemonInfo, size int64, newobjname string) string {
 	var (
-		hash   string
-		errstr string
+		xxhashval string
+		errstr    string
 	)
 	if size == 0 {
 		return fmt.Sprintf("Unexpected: %s/%s size is zero", bucket, objname)
@@ -1101,7 +1136,7 @@ func (t *targetrunner) sendfile(method, bucket, objname string, destsi *daemonIn
 		assert(cksumcfg.Checksum == ChecksumXXHash)
 		buf := slab.alloc()
 		xx := xxhash.New64()
-		if hash, errstr = ComputeXXHash(file, buf, xx); errstr != "" {
+		if xxhashval, errstr = ComputeXXHash(file, buf, xx); errstr != "" {
 			slab.free(buf)
 			return errstr
 		}
@@ -1118,9 +1153,9 @@ func (t *targetrunner) sendfile(method, bucket, objname string, destsi *daemonIn
 	if err != nil {
 		return fmt.Sprintf("Unexpected failure to create %s request %s, err: %v", method, url, err)
 	}
-	if hash != "" {
+	if xxhashval != "" {
 		request.Header.Set(HeaderDfcChecksumType, ChecksumXXHash)
-		request.Header.Set(HeaderDfcChecksumVal, hash)
+		request.Header.Set(HeaderDfcChecksumVal, xxhashval)
 	}
 	response, err := t.httpclient.Do(request)
 	if err != nil {
@@ -1535,23 +1570,34 @@ func (t *targetrunner) mpath2Fsid() (fsmap map[syscall.Fsid]string) {
 	return
 }
 
-// on err closes and removes the file; othwerise closes and returns the size
-// omd5 or oxxhash can be empty depending on configuration and operation.
-func (t *targetrunner) receiveFileAndFinalize(fqn, objname, omd5 string, ohobj cksumvalue,
-	reader io.Reader) (nhobj cksumvalue, written int64, errstr string) {
+//=====
+// on err: closes and removes the file; othwerise closes and returns the size;
+// empty omd5 or oxxhash: not considered an exception even when the configuration says otherwise;
+// xxhash is always preferred over md5
+//=====
+func (t *targetrunner) receive(fqn string, inmem bool, objname, omd5 string, ohobj cksumvalue,
+	reader io.Reader) (sgl *SGLIO, nhobj cksumvalue, written int64, errstr string) {
 	var (
 		err                  error
 		file                 *os.File
+		filewriter           io.Writer
 		ohtype, ohval, nhval string
+		cksumcfg             = &ctx.config.CksumConfig
 	)
-	cksumcfg := &ctx.config.CksumConfig
-	if file, errstr = initobj(fqn); errstr != "" {
-		errstr = fmt.Sprintf("Failed to create and initialize %s, err: %s", fqn, errstr)
-		return
+	// ack policy = memory
+	if inmem {
+		sgl = NewSGLIO(0)
+		filewriter = sgl
+	} else {
+		if file, errstr = initobj(fqn); errstr != "" {
+			errstr = fmt.Sprintf("Failed to create and initialize %s, err: %s", fqn, errstr)
+			return
+		}
+		filewriter = file
 	}
 	slab := selectslab(0)
 	buf := slab.alloc()
-	defer func() {
+	defer func() { // free & cleanup on err
 		slab.free(buf)
 		if errstr == "" {
 			return
@@ -1559,16 +1605,15 @@ func (t *targetrunner) receiveFileAndFinalize(fqn, objname, omd5 string, ohobj c
 		if err = file.Close(); err != nil {
 			glog.Errorf("Nested: failed to close received file %s, err: %v", fqn, err)
 		}
-		// FIXME: immediately remove evidence..
 		if err = os.Remove(fqn); err != nil {
 			glog.Errorf("Nested error %s => (remove %s => err: %v)", errstr, fqn, err)
 		}
 	}()
-	// xxhash is always preferred over md5
+	// receive and checksum
 	if cksumcfg.Checksum != ChecksumNone {
 		assert(cksumcfg.Checksum == ChecksumXXHash)
 		xx := xxhash.New64()
-		if written, errstr = ReceiveFile(file, reader, buf, xx); errstr != "" {
+		if written, errstr = ReceiveAndChecksum(filewriter, reader, buf, xx); errstr != "" {
 			return
 		}
 		hashIn64 := xx.Sum64()
@@ -1576,39 +1621,35 @@ func (t *targetrunner) receiveFileAndFinalize(fqn, objname, omd5 string, ohobj c
 		binary.BigEndian.PutUint64(hashInBytes, hashIn64)
 		nhval = hex.EncodeToString(hashInBytes)
 		nhobj = newcksumvalue(ChecksumXXHash, nhval)
-		// Legacy objects may not have chksum.
 		if ohobj != nil {
 			ohtype, ohval = ohobj.get()
 			assert(ohtype == ChecksumXXHash)
 			if ohval != nhval {
-				errstr = fmt.Sprintf("Checksum mismatch: object %s xxhash %s... != received file %s xxhash %s...)",
-					objname, ohval, fqn, nhval)
+				errstr = fmt.Sprintf("Bad checksum: %s %s %s... != %s... computed for the %q",
+					objname, cksumcfg.Checksum, ohval[:8], nhval[:8], fqn)
 				return
 			}
 		}
 	} else if omd5 != "" && cksumcfg.ValidateColdGet {
-		// MD5 hash is only computed for validation(not stored).
 		md5 := md5.New()
-		if written, errstr = ReceiveFile(file, reader, buf, md5); errstr != "" {
+		if written, errstr = ReceiveAndChecksum(filewriter, reader, buf, md5); errstr != "" {
 			return
 		}
 		hashInBytes := md5.Sum(nil)[:16]
 		md5hash := hex.EncodeToString(hashInBytes)
 		if omd5 != md5hash {
-			errstr = fmt.Sprintf("Checksum mismatch: object %s MD5 %s... != received file %s MD5 %s...)",
-				objname, omd5[:8], fqn, md5hash[:8])
+			errstr = fmt.Sprintf("Bad checksum: cold GET %s md5 %s... != %s... computed for the %q",
+				objname, ohval[:8], nhval[:8], fqn)
 			return
 		}
 	} else {
-		if written, errstr = ReceiveFile(file, reader, buf); errstr != "" {
+		if written, errstr = ReceiveAndChecksum(filewriter, reader, buf); errstr != "" {
 			return
 		}
 	}
-	if nhobj != nil {
-		assert(nhval != "")
-		if errstr = finalizeobj(fqn, nhval); errstr != "" {
-			return
-		}
+	// close and done
+	if inmem {
+		return
 	}
 	if err = file.Close(); err != nil {
 		errstr = fmt.Sprintf("Failed to close received file %s, err: %v", fqn, err)
@@ -1629,11 +1670,12 @@ func initobj(fqn string) (file *os.File, errstr string) {
 	return file, ""
 }
 
-// FIXME: does only xxhash
-func finalizeobj(fqn string, hash string) (errstr string) {
-	if len(hash) == 0 {
+func finalizeobj(fqn string, nhobj cksumvalue) (errstr string) {
+	if nhobj == nil {
 		return
 	}
-	errstr = Setxattr(fqn, xattrXXHashVal, []byte(hash))
+	htype, hval := nhobj.get()
+	assert(htype == ChecksumXXHash)
+	errstr = Setxattr(fqn, xattrXXHashVal, []byte(hval))
 	return
 }

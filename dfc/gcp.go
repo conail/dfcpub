@@ -180,7 +180,9 @@ func (gcpimpl *gcpimpl) getobj(fqn string, bucket string, objname string) (nhobj
 	}
 	defer rc.Close()
 	// hashtype and hash could be empty for legacy objects.
-	if nhobj, size, errstr = gcpimpl.t.receiveFileAndFinalize(fqn, objname, md5, v, rc); errstr != "" {
+	inmem := (ctx.config.AckPolicy.ColdGet == AckWhenInMem)
+	assert(!inmem, "niy")
+	if _, nhobj, size, errstr = gcpimpl.t.receive(fqn, inmem, objname, md5, v, rc); errstr != "" {
 		return
 	}
 	if glog.V(3) {

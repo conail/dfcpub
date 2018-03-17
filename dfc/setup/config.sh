@@ -12,6 +12,7 @@
 		"long_timeout":		"30m"
 	},
 	"keep_alive_time":		"30s",
+	"h2c": 				false,
 	"listen": {
 		"proto": 		"tcp",
 		"port":			"${PORT}"
@@ -44,6 +45,10 @@
 		"/tmp/dfc":		"",
 		"/disk2/dfc":		""
 	},
-	"h2c": 				false
+	"ack_policy": {
+		"cold_get":		"disk",
+		"put":			"disk",
+		"max_mem_mb":		16
+	}
 }
 EOL
