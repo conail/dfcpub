@@ -132,21 +132,13 @@ func ReceiveAndChecksum(filewriter io.Writer, rrbody io.Reader,
 	return
 }
 
-func Createfile(fname string) (*os.File, error) {
-	var file *os.File
-	var err error
-	// strips the last part from filepath
+func CreateFile(fname string) (file *os.File, err error) {
 	dirname := filepath.Dir(fname)
 	if err = CreateDir(dirname); err != nil {
-		glog.Errorf("Failed to create local dir %s, err: %v", dirname, err)
-		return nil, err
+		return
 	}
 	file, err = os.Create(fname)
-	if err != nil {
-		glog.Errorf("Unable to create file %s, err: %v", fname, err)
-		return nil, err
-	}
-	return file, nil
+	return
 }
 
 func ComputeMD5(reader io.Reader, buf []byte, md5 hash.Hash) (csum string, errstr string) {

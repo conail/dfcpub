@@ -160,29 +160,29 @@ func (p *proxyrunner) httpfilget(w http.ResponseWriter, r *http.Request) {
 		p.invalmsghdlr(w, r, errstr)
 		return
 	}
-
-	if len(objname) != 0 {
-		p.statsif.add("numget", 1)
-		si, errstr := hrwTarget(bucket+"/"+objname, ctx.smap)
-		if errstr != "" {
-			p.invalmsghdlr(w, r, errstr)
-			return
-		}
-		redirecturl := fmt.Sprintf("%s%s?%s=false", si.DirectURL, r.URL.Path, ParamLocal)
-		if glog.V(3) {
-			glog.Infof("Redirecting %q to %s (%s)", r.URL.Path, si.DirectURL, r.Method)
-		}
-		if !ctx.config.Proxy.Passthru && len(objname) > 0 {
-			glog.Infof("passthru=false: proxy initiates the GET %s/%s", bucket, objname)
-			p.receiveDrop(w, r, redirecturl) // ignore error, proceed to http redirect
-		}
-
-		http.Redirect(w, r, redirecturl, http.StatusMovedPermanently)
+	// listbucket
+	if len(objname) == 0 {
+		p.statsif.add("numlist", 1)
+		p.listbucket(w, r, bucket)
 		return
 	}
 
-	p.statsif.add("numlist", 1)
-	p.listbucket(w, r, bucket)
+	// GET
+	p.statsif.add("numget", 1)
+	si, errstr := hrwTarget(bucket+"/"+objname, ctx.smap)
+	if errstr != "" {
+		p.invalmsghdlr(w, r, errstr)
+		return
+	}
+	redirecturl := fmt.Sprintf("%s%s?%s=false", si.DirectURL, r.URL.Path, ParamLocal)
+	if glog.V(3) {
+		glog.Infof("Redirecting %q to %s (%s)", r.URL.Path, si.DirectURL, r.Method)
+	}
+	if !ctx.config.Proxy.Passthru && len(objname) > 0 {
+		glog.Infof("passthru=false: proxy initiates the GET %s/%s", bucket, objname)
+		p.receiveDrop(w, r, redirecturl) // ignore error, proceed to http redirect
+	}
+	http.Redirect(w, r, redirecturl, http.StatusMovedPermanently)
 }
 
 // For cached = false goes to the Cloud, otherwise returns locally cached files
@@ -435,7 +435,6 @@ func (p *proxyrunner) listbucket(w http.ResponseWriter, r *http.Request, bucket 
 		p.invalmsghdlr(w, r, err.Error())
 		return
 	}
-
 	jsbytes, err := json.Marshal(allentries)
 	assert(err == nil, err)
 	_ = p.writeJSON(w, r, jsbytes, "listbucket")

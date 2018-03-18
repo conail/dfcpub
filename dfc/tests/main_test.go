@@ -526,7 +526,7 @@ func getAndCopyOne(id int, t *testing.T, errch chan error, bucket, keyname, url 
 	}(r)
 	// Create a local copy
 	fname := LocalDestDir + "/" + keyname
-	file, err := dfc.Createfile(fname)
+	file, err := dfc.CreateFile(fname)
 	if err != nil {
 		t.Errorf("Worker %2d: Failed to create file, err: %v", id, err)
 		failed = true

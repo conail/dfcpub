@@ -315,9 +315,8 @@ func (h *httprunner) writeJSON(w http.ResponseWriter, r *http.Request, jsbytes [
 	if _, err := w.Write(jsbytes); err != nil {
 		errstr = fmt.Sprintf("%s: Failed to write json, err: %v", tag, err)
 		if isSyscallWriteError(err) {
-			// FIXME: if we cannot write, how can we then write http.Error()..
-			glog.Errorf("isSyscallWriteError: %s", errstr)
-			time.Sleep(time.Second)
+			// FIXME: cannot write http.Error()
+			glog.Errorf("isSyscallWriteError: %s - cannot write response", errstr)
 		}
 		h.invalmsghdlr(w, r, errstr)
 	}

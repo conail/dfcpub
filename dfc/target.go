@@ -755,33 +755,37 @@ func (t *targetrunner) doput(w http.ResponseWriter, r *http.Request, bucket, obj
 	}
 	// commit
 	if sgl == nil {
-		return t.putCloudRename(bucket, objname, putfqn, fqn, nhobj)
+		return t.putCommit(bucket, objname, putfqn, fqn, nhobj, false)
 	}
-	//
-	// FIXME: AA: hanbdle errors, use xaction
-	//
-	go func() {
-		file, err := os.Open(putfqn)
-		assert(err == nil, err)
-		glog.Infoln("inmem-open", putfqn)
-		slab := selectslab(sgl.Size())
-		buf := slab.alloc()
-		reader := NewReader(sgl)
-		written, err := io.CopyBuffer(file, reader, buf)
-		glog.Infoln("inmem-copied sgl=>", putfqn)
-		assert(err == nil, err)
-		assert(written == sgl.Size())
-		err = file.Close()
-		glog.Infoln("inmem-closed", putfqn)
-		assert(err == nil, err)
-		errstr, errcode = t.putCloudRename(bucket, objname, putfqn, fqn, nhobj)
-		assert(errstr == "", errstr)
-		glog.Infoln("inmem-committed", fqn)
-	}()
+	// FIXME: AA: use xaction
+	go t.sglToCloudRename(sgl, bucket, objname, putfqn, fqn, nhobj)
 	return
 }
 
-func (t *targetrunner) putCloudRename(bucket, objname, putfqn, fqn string, nhobj cksumvalue) (errstr string, errcode int) {
+// FIXME: AA: handle errors
+func (t *targetrunner) sglToCloudRename(sgl *SGLIO, bucket, objname, putfqn, fqn string, nhobj cksumvalue) {
+	file, err := CreateFile(putfqn)
+	assert(err == nil, err)
+	glog.Infoln("inmem: create", putfqn)
+	slab := selectslab(sgl.Size())
+	buf := slab.alloc()
+	reader := NewReader(sgl)
+	written, err := io.CopyBuffer(file, reader, buf)
+	glog.Infoln("inmem: copied sgl=>", putfqn)
+	assert(err == nil, err)
+	assert(written == sgl.Size())
+	err = file.Close()
+	assert(err == nil, err)
+	glog.Infoln("inmem: closed", putfqn)
+	sgl.Free()
+	slab.free(buf)
+
+	errstr, _ := t.putCommit(bucket, objname, putfqn, fqn, nhobj, false)
+	assert(errstr == "", errstr)
+	glog.Infoln("inmem: done", fqn)
+}
+
+func (t *targetrunner) putCommit(bucket, objname, putfqn, fqn string, nhobj cksumvalue, rebalance bool) (errstr string, errcode int) {
 	var (
 		file *os.File
 		err  error
@@ -794,7 +798,7 @@ func (t *targetrunner) putCloudRename(bucket, objname, putfqn, fqn string, nhobj
 		}
 	}()
 	// cloud
-	if !t.islocalBucket(bucket) {
+	if !t.islocalBucket(bucket) && !rebalance {
 		if file, err = os.Open(putfqn); err != nil {
 			errstr = fmt.Sprintf("Failed to re-open %s err: %v", putfqn, err)
 			return
@@ -866,7 +870,7 @@ func (t *targetrunner) dorebalance(r *http.Request, from, to, bucket, objname st
 		}
 	} else {
 		//
-		// the destination - FIXME: AA: xxhash & validation
+		// the destination - FIXME: AA: xxhash validation
 		//
 		if glog.V(3) {
 			glog.Infof("Rebalance to %q: bucket %q objname %q <= from %q", to, bucket, objname, from)
@@ -879,12 +883,23 @@ func (t *targetrunner) dorebalance(r *http.Request, from, to, bucket, objname st
 		}
 		var (
 			hdhobj = newcksumvalue(r.Header.Get(HeaderDfcChecksumType), r.Header.Get(HeaderDfcChecksumVal))
-			inmem  = (ctx.config.AckPolicy.Put == AckWhenInMem)
+			nhobj  cksumvalue
+			inmem  = false
 		)
-		if _, _, size, errstr = t.receive(putfqn, inmem, objname, "", hdhobj, r.Body); errstr != "" {
+		if _, nhobj, size, errstr = t.receive(putfqn, inmem, objname, "", hdhobj, r.Body); errstr != "" {
 			return
 		}
-		errstr = t.safeRename(bucket, objname, putfqn, fqn)
+		if nhobj != nil {
+			nhtype, nhval := nhobj.get()
+			htype, hval := hdhobj.get()
+			assert(htype == nhtype)
+			if hval != nhval {
+				errstr = fmt.Sprintf("Bad checksum at the destination %s: %s/%s %s %s... != %s...",
+					t.si.DaemonID, bucket, objname, htype, hval[:8], nhval[:8])
+				return
+			}
+		}
+		errstr, _ = t.putCommit(bucket, objname, putfqn, fqn, nhobj, true)
 	}
 	return
 }
@@ -921,7 +936,6 @@ func (t *targetrunner) httpfildelete(w http.ResponseWriter, r *http.Request) {
 		t.invalmsghdlr(w, r, s)
 		return
 	}
-
 	if objname == "" && len(b) > 0 {
 		// It must be a List/Range request, since there is no object name
 		t.deletefiles(w, r, msg)
@@ -934,7 +948,6 @@ func (t *targetrunner) httpfildelete(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-
 	s := fmt.Sprintf("Invalid API request: No object name or message body.")
 	t.invalmsghdlr(w, r, s)
 }
@@ -1589,8 +1602,8 @@ func (t *targetrunner) receive(fqn string, inmem bool, objname, omd5 string, oho
 		sgl = NewSGLIO(0)
 		filewriter = sgl
 	} else {
-		if file, errstr = initobj(fqn); errstr != "" {
-			errstr = fmt.Sprintf("Failed to create and initialize %s, err: %s", fqn, errstr)
+		if file, err = CreateFile(fqn); err != nil {
+			errstr = fmt.Sprintf("Failed to create %s, err: %s", fqn, err)
 			return
 		}
 		filewriter = file
@@ -1655,19 +1668,6 @@ func (t *targetrunner) receive(fqn string, inmem bool, objname, omd5 string, oho
 		errstr = fmt.Sprintf("Failed to close received file %s, err: %v", fqn, err)
 	}
 	return
-}
-
-//
-// pre- and post- wrappers
-//
-func initobj(fqn string) (file *os.File, errstr string) {
-	var err error
-	file, err = Createfile(fqn)
-	if err != nil {
-		errstr = fmt.Sprintf("Unable to create file %s, err: %v", fqn, err)
-		return nil, errstr
-	}
-	return file, ""
 }
 
 func finalizeobj(fqn string, nhobj cksumvalue) (errstr string) {
