@@ -153,7 +153,7 @@ func (gcpimpl *gcpimpl) headbucket(bucket string) (bucketprops map[string]string
 		errstr = fmt.Sprintf("gcp: Failed to get attributes (bucket %s), err: %v", bucket, err)
 		return
 	}
-	bucketprops[HeaderServer] = googlecloud
+	bucketprops[CloudProvider] = googlecloud
 	return
 }
 
@@ -171,7 +171,7 @@ func (gcpimpl *gcpimpl) headobject(bucket string, objname string) (objmeta map[s
 		errstr = fmt.Sprintf("gcp: Failed to retrieve %s/%s metadata, err: %v", bucket, objname, err)
 		return
 	}
-	objmeta[HeaderServer] = googlecloud
+	objmeta[CloudProvider] = googlecloud
 	objmeta["version"] = fmt.Sprintf("%d", attrs.Generation)
 	return
 }
@@ -198,18 +198,17 @@ func (gcpimpl *gcpimpl) getobj(fqn string, bucket string, objname string) (props
 	}
 	defer rc.Close()
 	// hashtype and hash could be empty for legacy objects.
-	props = &objectProps{}
+	props = &objectProps{version: fmt.Sprintf("%d", attrs.Generation)}
 	if _, props.nhobj, props.size, errstr = gcpimpl.t.receive(fqn, false, objname, md5, v, rc); errstr != "" {
 		return
 	}
-	props.version = fmt.Sprintf("%d", attrs.Generation)
 	if glog.V(3) {
 		glog.Infof("gcp: GET %s/%s", bucket, objname)
 	}
 	return
 }
 
-func (gcpimpl *gcpimpl) putobj(file *os.File, bucket, objname string, ohash cksumvalue) (errstr string, errcode int) {
+func (gcpimpl *gcpimpl) putobj(file *os.File, bucket, objname string, ohash cksumvalue) (version string, errstr string, errcode int) {
 	var (
 		htype, hval string
 		md          map[string]string
@@ -224,7 +223,8 @@ func (gcpimpl *gcpimpl) putobj(file *os.File, bucket, objname string, ohash cksu
 		md[gcpDfcHashType] = htype
 		md[gcpDfcHashVal] = hval
 	}
-	wc := client.Bucket(bucket).Object(objname).NewWriter(gctx)
+	gcpObj := client.Bucket(bucket).Object(objname)
+	wc := gcpObj.NewWriter(gctx)
 	wc.Metadata = md
 	slab := selectslab(0)
 	buf := slab.alloc()
@@ -238,8 +238,14 @@ func (gcpimpl *gcpimpl) putobj(file *os.File, bucket, objname string, ohash cksu
 		errstr = fmt.Sprintf("gcp: PUT %s/%s: failed to close wc, err: %v", bucket, objname, err)
 		return
 	}
+	attr, err := gcpObj.Attrs(gctx)
+	if err != nil {
+		errstr = fmt.Sprintf("gcp: PUT %s/%s: failed to read updated object attributes, err: %v", bucket, objname, err)
+		return
+	}
+	version = fmt.Sprintf("%d", attr.Generation)
 	if glog.V(3) {
-		glog.Infof("gcp: PUT %s/%s, size %d", bucket, objname, written)
+		glog.Infof("gcp: PUT %s/%s, size %d, version %s", bucket, objname, written, version)
 	}
 	return
 }

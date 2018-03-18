@@ -25,6 +25,11 @@ const (
 	ChecksumNone   = "none"
 	ChecksumXXHash = "xxhash"
 	ChecksumMD5    = "md5"
+
+	VersionAll   = "all"
+	VersionCloud = "cloud"
+	VersionLocal = "local"
+	VersionNone  = "none"
 )
 
 const (

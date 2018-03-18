@@ -403,7 +403,9 @@ func (t *targetrunner) prefetchMissing(objname, bucket string) {
 	t.statsif.add("numprefetch", 1)
 	t.statsif.add("bytesprefetched", props.size)
 	if props.version != "" {
-		Setxattr(fqn, xattrObjVersion, []byte(props.version))
+		if errstr := finalizeobj(fqn, props); errstr != "" {
+			glog.Errorf("Setting object properties failed: %s", errstr)
+		}
 	}
 	if vchanged {
 		t.statsif.add("bytesvchanged", props.size)

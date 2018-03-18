@@ -304,15 +304,39 @@ func (t *targetrunner) httpfilget(w http.ResponseWriter, r *http.Request) {
 			t.statsif.add("bytesvchanged", size)
 			t.statsif.add("numvchanged", 1)
 		}
+		if errstr = finalizeobj(fqn, props); errstr != "" {
+			glog.Errorf("Setting object properties failed: %s", errstr)
+		}
 	}
 	//
 	// downgrade lock(name)
 	//
 	exclusive = false
 	t.rtnamemap.downgradelock(uname)
+
 	//
 	// local file => http response
 	//
+	if size == 0 {
+		errstr = fmt.Sprintf("Unexpected: object %s/%s size is zero", bucket, objname)
+		t.invalmsghdlr(w, r, errstr)
+		return // likely, an error
+	}
+	if !coldget && cksumcfg.Checksum != ChecksumNone {
+		hashbinary, errstr := Getxattr(fqn, xattrXXHashVal)
+		if errstr == "" && hashbinary != nil {
+			nhobj = newcksumvalue(cksumcfg.Checksum, string(hashbinary))
+		}
+	}
+	if nhobj != nil {
+		htype, hval := nhobj.get()
+		w.Header().Add(HeaderDfcChecksumType, htype)
+		w.Header().Add(HeaderDfcChecksumVal, hval)
+	}
+	if props != nil && props.version != "" {
+		w.Header().Add(HeaderDfcObjVersion, props.version)
+	}
+
 	file, err := os.Open(fqn)
 	if err != nil {
 		if os.IsPermission(err) {
@@ -326,22 +350,6 @@ func (t *targetrunner) httpfilget(w http.ResponseWriter, r *http.Request) {
 	}
 
 	defer file.Close()
-	if !coldget && cksumcfg.Checksum != ChecksumNone {
-		hashbinary, errstr := Getxattr(fqn, xattrXXHashVal)
-		if errstr == "" && hashbinary != nil {
-			nhobj = newcksumvalue(cksumcfg.Checksum, string(hashbinary))
-		}
-	}
-	if nhobj != nil {
-		htype, hval := nhobj.get()
-		w.Header().Add(HeaderDfcChecksumType, htype)
-		w.Header().Add(HeaderDfcChecksumVal, hval)
-	}
-	if size == 0 {
-		errstr = fmt.Sprintf("Unexpected: object %s/%s size is zero", bucket, objname)
-		t.invalmsghdlr(w, r, errstr)
-		return // likely, an error
-	}
 	slab := selectslab(size)
 	buf := slab.alloc()
 	defer slab.free(buf)
@@ -354,9 +362,6 @@ func (t *targetrunner) httpfilget(w http.ResponseWriter, r *http.Request) {
 	}
 	if glog.V(3) {
 		glog.Infof("GET: sent %s (%.2f MB)", fqn, float64(written)/1000/1000)
-	}
-	if coldget && props.version != "" {
-		Setxattr(fqn, xattrObjVersion, []byte(props.version))
 	}
 	t.statsif.add("numget", 1)
 }
@@ -560,10 +565,12 @@ func (t *targetrunner) listbucket(w http.ResponseWriter, r *http.Request, bucket
 	islocal, errstr, errcode := t.checkLocalQueryParameter(bucket, r)
 	if errstr != "" {
 		t.invalmsghdlr(w, r, errstr, errcode)
+		return
 	}
 	useCache, errstr, errcode := t.checkCacheQueryParameter(r)
 	if errstr != "" {
 		t.invalmsghdlr(w, r, errstr, errcode)
+		return
 	}
 
 	msg := &GetMsg{}
@@ -789,15 +796,16 @@ func (t *targetrunner) doput(w http.ResponseWriter, r *http.Request, bucket, obj
 		return
 	}
 	// commit
+	props := &objectProps{nhobj: nhobj}
 	if sgl == nil {
-		return t.putCommit(bucket, objname, putfqn, fqn, nhobj, false)
+		return t.putCommit(bucket, objname, putfqn, fqn, props, false)
 	}
 	// FIXME: AA: use xaction
-	go t.sglToCloudAsync(sgl, bucket, objname, putfqn, fqn, nhobj)
+	go t.sglToCloudAsync(sgl, bucket, objname, putfqn, fqn, props)
 	return
 }
 
-func (t *targetrunner) sglToCloudAsync(sgl *SGLIO, bucket, objname, putfqn, fqn string, nhobj cksumvalue) {
+func (t *targetrunner) sglToCloudAsync(sgl *SGLIO, bucket, objname, putfqn, fqn string, objprops *objectProps) {
 	slab := selectslab(sgl.Size())
 	buf := slab.alloc()
 	defer func() {
@@ -831,7 +839,7 @@ func (t *targetrunner) sglToCloudAsync(sgl *SGLIO, bucket, objname, putfqn, fqn 
 		}
 		return
 	}
-	errstr, _ := t.putCommit(bucket, objname, putfqn, fqn, nhobj, false)
+	errstr, _ := t.putCommit(bucket, objname, putfqn, fqn, objprops, false)
 	if errstr != "" {
 		glog.Errorln("sglToCloudAsync: commit", errstr)
 		return
@@ -839,7 +847,8 @@ func (t *targetrunner) sglToCloudAsync(sgl *SGLIO, bucket, objname, putfqn, fqn 
 	glog.Infof("sglToCloudAsync: %s/%s done", bucket, objname)
 }
 
-func (t *targetrunner) putCommit(bucket, objname, putfqn, fqn string, nhobj cksumvalue, rebalance bool) (errstr string, errcode int) {
+func (t *targetrunner) putCommit(bucket, objname, putfqn, fqn string,
+	objprops *objectProps, rebalance bool) (errstr string, errcode int) {
 	var (
 		file *os.File
 		err  error
@@ -857,7 +866,7 @@ func (t *targetrunner) putCommit(bucket, objname, putfqn, fqn string, nhobj cksu
 			errstr = fmt.Sprintf("Failed to reopen %s err: %v", putfqn, err)
 			return
 		}
-		if errstr, errcode = getcloudif().putobj(file, bucket, objname, nhobj); errstr != "" {
+		if objprops.version, errstr, errcode = getcloudif().putobj(file, bucket, objname, objprops.nhobj); errstr != "" {
 			_ = file.Close()
 			return
 		}
@@ -871,8 +880,7 @@ func (t *targetrunner) putCommit(bucket, objname, putfqn, fqn string, nhobj cksu
 	if errstr = t.putSafeRename(bucket, objname, putfqn, fqn); errstr != "" {
 		return
 	}
-	// FIXME: PUT must be returning the version - use it here to "finalize"
-	if errstr = finalizeobj(fqn, nhobj); errstr != "" {
+	if errstr = finalizeobj(fqn, objprops); errstr != "" {
 		return
 	}
 	t.statsif.add("numput", 1)
@@ -942,14 +950,14 @@ func (t *targetrunner) dorebalance(r *http.Request, from, to, bucket, objname st
 		}
 		var (
 			hdhobj = newcksumvalue(r.Header.Get(HeaderDfcChecksumType), r.Header.Get(HeaderDfcChecksumVal))
-			nhobj  cksumvalue
 			inmem  = false // TODO
+			props  = &objectProps{version: r.Header.Get(HeaderDfcObjVersion)}
 		)
-		if _, nhobj, size, errstr = t.receive(putfqn, inmem, objname, "", hdhobj, r.Body); errstr != "" {
+		if _, props.nhobj, size, errstr = t.receive(putfqn, inmem, objname, "", hdhobj, r.Body); errstr != "" {
 			return
 		}
-		if nhobj != nil {
-			nhtype, nhval := nhobj.get()
+		if props.nhobj != nil {
+			nhtype, nhval := props.nhobj.get()
 			htype, hval := hdhobj.get()
 			assert(htype == nhtype)
 			if hval != nhval {
@@ -958,7 +966,7 @@ func (t *targetrunner) dorebalance(r *http.Request, from, to, bucket, objname st
 				return
 			}
 		}
-		errstr, _ = t.putCommit(bucket, objname, putfqn, fqn, nhobj, true)
+		errstr, _ = t.putCommit(bucket, objname, putfqn, fqn, props, true)
 	}
 	return
 }
@@ -1183,6 +1191,7 @@ func (t *targetrunner) sendfile(method, bucket, objname string, destsi *daemonIn
 	var (
 		xxhashval string
 		errstr    string
+		version   []byte
 	)
 	if size == 0 {
 		return fmt.Sprintf("Unexpected: %s/%s size is zero", bucket, objname)
@@ -1202,6 +1211,10 @@ func (t *targetrunner) sendfile(method, bucket, objname string, destsi *daemonIn
 		return fmt.Sprintf("Failed to open %q, err: %v", fqn, err)
 	}
 	defer file.Close()
+
+	if version, errstr = Getxattr(fqn, xattrObjVersion); errstr != "" {
+		glog.Errorf("Failed to read %q xattr %s, err %s", fqn, xattrObjVersion, errstr)
+	}
 
 	slab := selectslab(size)
 	if cksumcfg.Checksum != ChecksumNone {
@@ -1228,6 +1241,9 @@ func (t *targetrunner) sendfile(method, bucket, objname string, destsi *daemonIn
 	if xxhashval != "" {
 		request.Header.Set(HeaderDfcChecksumType, ChecksumXXHash)
 		request.Header.Set(HeaderDfcChecksumVal, xxhashval)
+	}
+	if len(version) != 0 {
+		request.Header.Set(HeaderDfcObjVersion, string(version))
 	}
 	response, err := t.httpclient.Do(request)
 	if err != nil {
@@ -1282,7 +1298,6 @@ func (t *targetrunner) httpfilhead(w http.ResponseWriter, r *http.Request) {
 	if !islocal {
 		bucketprops, errstr, errcode = getcloudif().headbucket(bucket)
 		if errstr != "" {
-			t.invalmsghdlr(w, r, errstr, http.StatusInternalServerError)
 			if errcode == 0 {
 				t.invalmsghdlr(w, r, errstr)
 			} else {
@@ -1292,7 +1307,7 @@ func (t *targetrunner) httpfilhead(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		bucketprops = make(map[string]string)
-		bucketprops[HeaderServer] = dfclocal
+		bucketprops[CloudProvider] = dfclocal
 	}
 
 	for k, v := range bucketprops {
@@ -1734,12 +1749,14 @@ func (t *targetrunner) receive(fqn string, inmem bool, objname, omd5 string, oho
 	return
 }
 
-func finalizeobj(fqn string, nhobj cksumvalue) (errstr string) {
-	if nhobj == nil {
-		return
+func finalizeobj(fqn string, objprops *objectProps) (errstr string) {
+	if objprops.nhobj != nil {
+		htype, hval := objprops.nhobj.get()
+		assert(htype == ChecksumXXHash)
+		errstr = Setxattr(fqn, xattrXXHashVal, []byte(hval))
 	}
-	htype, hval := nhobj.get()
-	assert(htype == ChecksumXXHash)
-	errstr = Setxattr(fqn, xattrXXHashVal, []byte(hval))
+	if errstr == "" && objprops.version != "" {
+		errstr = Setxattr(fqn, xattrObjVersion, []byte(objprops.version))
+	}
 	return
 }

@@ -235,7 +235,7 @@ func (p *proxyrunner) consumeCachedList(bmap map[string]*BucketEntry,
 // Request list of all cached files from a target.
 // The target returns its list in batches `cachedPageSize` length
 func (p *proxyrunner) generateCachedList(bucket string, daemon *daemonInfo,
-	dataCh chan *cachedFileBatch, wg *sync.WaitGroup, msg GetMsg) {
+	dataCh chan *cachedFileBatch, wg *sync.WaitGroup, origmsg *GetMsg) {
 	const (
 		cachedObjects = true
 		islocal       = false
@@ -244,6 +244,8 @@ func (p *proxyrunner) generateCachedList(bucket string, daemon *daemonInfo,
 		defer wg.Done()
 	}
 
+	var msg GetMsg
+	copyStruct(&msg, origmsg)
 	for {
 		// re-Marshall request arguments every time because PageMarker
 		// changes every loop run
@@ -298,8 +300,8 @@ func (p *proxyrunner) generateCachedList(bucket string, daemon *daemonInfo,
 // Get list of cached files from all targets and update the list
 // of files from cloud with local metadata (iscached, atime etc)
 func (p *proxyrunner) collectCachedFileList(bucket string, fileList *BucketList, getmsgjson []byte) (err error) {
-	reqParams := GetMsg{}
-	err = json.Unmarshal(getmsgjson, &reqParams)
+	reqParams := &GetMsg{}
+	err = json.Unmarshal(getmsgjson, reqParams)
 	if err != nil {
 		return
 	}

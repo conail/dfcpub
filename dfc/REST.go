@@ -39,9 +39,10 @@ const (
 
 // Header Key enum
 const (
-	HeaderServer          = "Server"                // Server: from Cloud Provider enum
+	CloudProvider         = "Server"                // Server: from Cloud Provider enum
 	HeaderDfcChecksumType = "HeaderDfcChecksumType" // Checksum Type (xxhash, md5, none)
 	HeaderDfcChecksumVal  = "HeaderDfcChecksumVal"  // Checksum Value
+	HeaderDfcObjVersion   = "HeaderDfcObjVersion"   // Object version/generation
 )
 
 // URL Query Parameter enum
