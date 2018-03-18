@@ -209,19 +209,40 @@ func (t *targetrunner) filehdlr(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// checkCloudVersion returns if versions of an object differ in Cloud and DFC cache
+// and the object should be refreshed from Cloud storage
+// It should be called only in case of the object is present in DFC cache
+func (t *targetrunner) checkCloudVersion(bucket, objname, version string) (vchanged bool, errstr string, errcode int) {
+	var objmeta map[string]string
+	if objmeta, errstr, errcode = t.cloudif.headobject(bucket, objname); errstr != "" {
+		return
+	}
+	if cloudVersion, ok := objmeta["version"]; ok {
+		if version != cloudVersion {
+			glog.Infof("Object %s/%s version changed, current version %s (old/local %s)",
+				bucket, objname, cloudVersion, version)
+			vchanged = true
+		}
+	}
+	return
+}
+
 // "/"+Rversion+"/"+Rfiles+"/"+bucket [+"/"+objname]
 //
 // checks if the object exists locally (if not, downloads it)
 // and sends it back via http
 func (t *targetrunner) httpfilget(w http.ResponseWriter, r *http.Request) {
 	var (
-		nhobj                               cksumvalue
-		coldget, exclusive                  bool
-		bucket, objname, fqn, uname, errstr string
-		size                                int64
-		errcode                             int
+		nhobj                        cksumvalue
+		coldget, exclusive, vchanged bool
+		bucket, objname, fqn         string
+		uname, errstr, version       string
+		size                         int64
+		errcode                      int
+		props                        *objectProps
 	)
 	cksumcfg := &ctx.config.CksumConfig
+	versioncfg := &ctx.config.VersionConfig
 	apitems := t.restAPIItems(r.URL.Path, 5)
 	if apitems = t.checkRestAPI(w, r, apitems, 1, Rversion, Rfiles); apitems == nil {
 		return
@@ -252,12 +273,19 @@ func (t *targetrunner) httpfilget(w http.ResponseWriter, r *http.Request) {
 	//
 	// get the object from the bucket
 	//
-	if coldget, size, errstr = t.getchecklocal(bucket, objname, fqn); errstr != "" {
+	if coldget, size, version, errstr = t.getchecklocal(bucket, objname, fqn); errstr != "" {
 		t.invalmsghdlr(w, r, errstr, http.StatusInternalServerError)
 		return
 	}
+	if !coldget && versioncfg.ValidateWarmGet && version != "" {
+		if vchanged, errstr, errcode = t.checkCloudVersion(bucket, objname, version); errstr != "" {
+			t.invalmsghdlr(w, r, errstr, errcode)
+			return
+		}
+		coldget = vchanged
+	}
 	if coldget {
-		if nhobj, size, errstr, errcode = getcloudif().getobj(fqn, bucket, objname); errstr != "" {
+		if props, errstr, errcode = getcloudif().getobj(fqn, bucket, objname); errstr != "" {
 			if errcode == 0 {
 				t.invalmsghdlr(w, r, errstr)
 			} else {
@@ -265,8 +293,13 @@ func (t *targetrunner) httpfilget(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
+		size, nhobj = props.size, props.nhobj
 		t.statsif.add("numcoldget", 1)
 		t.statsif.add("bytesloaded", size)
+		if vchanged {
+			t.statsif.add("bytesvchanged", size)
+			t.statsif.add("numvchanged", 1)
+		}
 	}
 	//
 	// downgrade lock(name)
@@ -316,29 +349,32 @@ func (t *targetrunner) httpfilget(w http.ResponseWriter, r *http.Request) {
 	} else if glog.V(3) {
 		glog.Infof("GET: sent %s (%.2f MB)", fqn, float64(written)/1000/1000)
 	}
+	if coldget && props.version != "" {
+		Setxattr(fqn, xattrObjVersion, []byte(props.version))
+	}
 	t.statsif.add("numget", 1)
 }
 
-func (t *targetrunner) getchecklocal(bucket, objname, fqn string) (coldget bool, size int64, errstr string) {
+func (t *targetrunner) getchecklocal(bucket, objname, fqn string) (coldget bool, size int64, version string, errstr string) {
 	finfo, err := os.Stat(fqn)
 	if err != nil {
 		switch {
 		case os.IsNotExist(err):
 			if t.islocalBucket(bucket) {
-				errstr = fmt.Sprintf("GET local: file %s (local bucket %s, object %s) does not exist",
-					fqn, bucket, objname)
+				errstr = fmt.Sprintf("GET local: file %s (object %s/%s) does not exist", fqn, bucket, objname)
 				return
 			}
 			coldget = true
 		case os.IsPermission(err):
 			errstr = fmt.Sprintf("Permission denied: access forbidden to %s", fqn)
-			return
 		default:
 			errstr = fmt.Sprintf("Failed to fstat %s, err: %v", fqn, err)
-			return
 		}
-	} else {
-		size = finfo.Size()
+		return
+	}
+	size = finfo.Size()
+	if bytes, errs := Getxattr(fqn, xattrObjVersion); errs == "" {
+		version = string(bytes)
 	}
 	return
 }
@@ -787,8 +823,10 @@ func (t *targetrunner) sglToCloudRename(sgl *SGLIO, bucket, objname, putfqn, fqn
 
 func (t *targetrunner) putCommit(bucket, objname, putfqn, fqn string, nhobj cksumvalue, rebalance bool) (errstr string, errcode int) {
 	var (
-		file *os.File
-		err  error
+		file    *os.File
+		err     error
+		objmeta map[string]string
+		coldput bool
 	)
 	defer func() {
 		if errstr != "" {
@@ -808,14 +846,34 @@ func (t *targetrunner) putCommit(bucket, objname, putfqn, fqn string, nhobj cksu
 			return
 		}
 		if err = file.Close(); err != nil {
-			// not failing as the cloud part is done
 			glog.Errorf("Unexpected failure to close an already PUT file %s, err: %v", putfqn, err)
+			_ = os.Remove(putfqn)
+			return
 		}
+		coldput = true
 	}
 	// when all set and done: lock the name, rename and set xattr
-	errstr = t.safeRename(bucket, objname, putfqn, fqn)
-	if errstr == "" {
-		errstr = finalizeobj(fqn, nhobj)
+	if errstr = t.safeRename(bucket, objname, putfqn, fqn); errstr != "" {
+		return
+	}
+	if errstr = finalizeobj(fqn, nhobj); errstr != "" {
+		return
+	}
+	if !coldput {
+		return
+	}
+	//
+	// FIXME: PUT must be returning the versioning - no need to execute yet another call
+	//
+	if objmeta, errstr, errcode = getcloudif().headobject(bucket, objname); errstr != "" {
+		glog.Errorf("Unexpected failure to get object version for an already PUT file %s, err: %v", putfqn, err)
+		return
+	}
+	if version, ok := objmeta["version"]; ok {
+		errstr = Setxattr(fqn, xattrObjVersion, []byte(version))
+		if errstr != "" {
+			glog.Errorf("Unexpected failure to set object attribute for an already PUT file %s, err: %v", putfqn, err)
+		}
 	}
 	return
 }
@@ -1196,11 +1254,11 @@ func (t *targetrunner) sendfile(method, bucket, objname string, destsi *daemonIn
 
 func (t *targetrunner) httpfilhead(w http.ResponseWriter, r *http.Request) {
 	var (
-		bucket  string
-		islocal bool
-		errstr  string
-		errcode int
-		headers map[string]string
+		bucket      string
+		islocal     bool
+		errstr      string
+		errcode     int
+		bucketprops map[string]string
 	)
 
 	apitems := t.restAPIItems(r.URL.Path, 5)
@@ -1221,7 +1279,7 @@ func (t *targetrunner) httpfilhead(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !islocal {
-		headers, errstr, errcode = getcloudif().headbucket(bucket)
+		bucketprops, errstr, errcode = getcloudif().headbucket(bucket)
 		if errstr != "" {
 			t.invalmsghdlr(w, r, errstr, http.StatusInternalServerError)
 			if errcode == 0 {
@@ -1232,11 +1290,11 @@ func (t *targetrunner) httpfilhead(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		headers = make(map[string]string)
-		headers[HeaderServer] = dfclocal
+		bucketprops = make(map[string]string)
+		bucketprops[HeaderServer] = dfclocal
 	}
 
-	for k, v := range headers {
+	for k, v := range bucketprops {
 		w.Header().Add(k, v)
 	}
 }
@@ -1640,6 +1698,8 @@ func (t *targetrunner) receive(fqn string, inmem bool, objname, omd5 string, oho
 			if ohval != nhval {
 				errstr = fmt.Sprintf("Bad checksum: %s %s %s... != %s... computed for the %q",
 					objname, cksumcfg.Checksum, ohval[:8], nhval[:8], fqn)
+				t.statsif.add("numbadchecksum", 1)
+				t.statsif.add("bytesbadchecksum", written)
 				return
 			}
 		}
@@ -1653,6 +1713,8 @@ func (t *targetrunner) receive(fqn string, inmem bool, objname, omd5 string, oho
 		if omd5 != md5hash {
 			errstr = fmt.Sprintf("Bad checksum: cold GET %s md5 %s... != %s... computed for the %q",
 				objname, ohval[:8], nhval[:8], fqn)
+			t.statsif.add("numbadchecksum", 1)
+			t.statsif.add("bytesbadchecksum", written)
 			return
 		}
 	} else {

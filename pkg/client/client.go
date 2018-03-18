@@ -25,8 +25,8 @@ import (
 )
 
 var (
-	httpclient            = &http.Client{Timeout: 10 * time.Second}
-	httpclientLongTimeout = &http.Client{Timeout: 2 * time.Minute}
+	httpclient            = &http.Client{Timeout: 30 * time.Second}
+	httpclientLongTimeout = &http.Client{Timeout: 5 * time.Minute}
 
 	ProxyProto      = "http"
 	ProxyIP         = "localhost"
@@ -132,7 +132,9 @@ func Get(proxyurl, bucket string, keyname string, wg *sync.WaitGroup, errch chan
 		if hdhashtype == dfc.ChecksumXXHash {
 			xx := xxhash.New64()
 			if hash, errstr = dfc.ComputeXXHash(r.Body, nil, xx); errstr != "" {
-				errch <- errors.New(errstr)
+				if errch != nil {
+					errch <- errors.New(errstr)
+				}
 			}
 			if hdhash != hash {
 				s := fmt.Sprintf("Header's hash %s doesn't match the file's %s \n", hdhash, hash)
@@ -386,7 +388,7 @@ func Put(proxyURL string, reader Reader, bucket string, key string, silent bool)
 	url := proxyURL + "/v1/files/" + bucket + "/" + key
 
 	if !silent {
-		fmt.Printf("PUT: object %s/%s - %s\n", bucket, key, reader.Description())
+		fmt.Printf("PUT: %s/%s\n", bucket, key)
 	}
 
 	handle, err := reader.Open()

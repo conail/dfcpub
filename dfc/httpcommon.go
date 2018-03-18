@@ -33,6 +33,12 @@ const (
 	initialBucketListSize = 512
 )
 
+type objectProps struct {
+	version string
+	size    int64
+	nhobj   cksumvalue
+}
+
 //===========
 //
 // interfaces
@@ -40,8 +46,9 @@ const (
 //===========
 type cloudif interface {
 	listbucket(bucket string, msg *GetMsg) (jsbytes []byte, errstr string, errcode int)
-	headbucket(bucket string) (headers map[string]string, errstr string, errcode int)
-	getobj(fqn, bucket, objname string) (nhobj cksumvalue, size int64, errstr string, errcode int)
+	headbucket(bucket string) (bucketprops map[string]string, errstr string, errcode int)
+	headobject(bucket string, objname string) (objmeta map[string]string, errstr string, errcode int)
+	getobj(fqn, bucket, objname string) (props *objectProps, errstr string, errcode int)
 	putobj(file *os.File, bucket, objname string, ohobj cksumvalue) (errstr string, errcode int)
 	deleteobj(bucket, objname string) (errstr string, errcode int)
 }
@@ -377,6 +384,12 @@ func (h *httprunner) setconfig(name, value string) (errstr string) {
 			errstr = fmt.Sprintf("Failed to parse validate_cold_get, err: %v", err)
 		} else {
 			ctx.config.CksumConfig.ValidateColdGet = v
+		}
+	case "validate_warm_get":
+		if v, err := strconv.ParseBool(value); err != nil {
+			errstr = fmt.Sprintf("Failed to parse validate_warm_get, err: %v", err)
+		} else {
+			ctx.config.VersionConfig.ValidateWarmGet = v
 		}
 	case "checksum":
 		if value == ChecksumXXHash || value == ChecksumNone {

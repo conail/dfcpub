@@ -19,7 +19,8 @@ import (
 
 // checksums: xattr, http header, and config
 const (
-	xattrXXHashVal = "user.obj.dfchash"
+	xattrXXHashVal  = "user.obj.dfchash"
+	xattrObjVersion = "user.obj.version"
 
 	ChecksumNone   = "none"
 	ChecksumXXHash = "xxhash"
@@ -54,6 +55,7 @@ type dfconfig struct {
 	S3               s3config          `json:"s3"`
 	LRUConfig        lruconfig         `json:"lru_config"`
 	CksumConfig      cksumconfig       `json:"cksum_config"`
+	VersionConfig    versionconfig     `json:"version_config"`
 	FSpaths          map[string]string `json:"fspaths"`
 	TestFSP          testfspathconf    `json:"test_fspaths"`
 	AckPolicy        ackpolicy         `json:"ack_policy"`
@@ -106,6 +108,11 @@ type httpconfig struct {
 	Timeout        time.Duration `json:"-"` // omitempty
 	LongTimeoutStr string        `json:"long_timeout"`
 	LongTimeout    time.Duration `json:"-"` // omitempty
+}
+
+type versionconfig struct {
+	// True enables object version validation for WARM GET.
+	ValidateWarmGet bool `json:"validate_warm_get"`
 }
 
 //==============================
