@@ -29,6 +29,7 @@ import (
 
 	"github.com/NVIDIA/dfcpub/cmd/dfcloader/stats"
 	"github.com/NVIDIA/dfcpub/dfc"
+	"github.com/NVIDIA/dfcpub/dfc/statsd"
 	"github.com/NVIDIA/dfcpub/pkg/client"
 	"github.com/NVIDIA/dfcpub/pkg/client/readers"
 )
@@ -81,6 +82,7 @@ var (
 	accumulatedStats     stats.Stats
 	allObjects           []string // All objects created under virtual directory myName
 	statsPrintHeader     = "%-10s%-6s%-22s\t%-22s\t%-36s\t%-22s\t%-10s\n"
+	statsdC              statsd.Client
 )
 
 func parseCmdLine() (params, error) {
@@ -182,6 +184,12 @@ func main() {
 
 	fmt.Printf("Found %d existing objects\n", len(allObjects))
 	logRunParams(runParams, os.Stdout)
+
+	statsdC, err = statsd.New("localhost", 8125, "loader")
+	if err != nil {
+		fmt.Println("Failed to connect to statd, running without statsd")
+	}
+	defer statsdC.Close()
 
 	workOrders = make(chan *workOrder, runParams.numWorkers)
 	workOrderResults = make(chan *workOrder, runParams.numWorkers)
@@ -452,6 +460,17 @@ func completeWorkOrder(wo *workOrder) {
 	case opGet:
 		if wo.err == nil {
 			intervalStats.AddGet(wo.size, delta)
+			statsdC.Send("get",
+				statsd.Metric{
+					Type:  statsd.Counter,
+					Name:  "count",
+					Value: 1,
+				},
+				statsd.Metric{
+					Type:  statsd.Timer,
+					Name:  "latency",
+					Value: float64(delta / time.Millisecond),
+				})
 		} else {
 			fmt.Println("Get failed: ", wo.err)
 			intervalStats.AddErrGet()
@@ -460,6 +479,17 @@ func completeWorkOrder(wo *workOrder) {
 		if wo.err == nil {
 			allObjects = append(allObjects, wo.objName)
 			intervalStats.AddPut(wo.size, delta)
+			statsdC.Send("put",
+				statsd.Metric{
+					Type:  statsd.Counter,
+					Name:  "count",
+					Value: 1,
+				},
+				statsd.Metric{
+					Type:  statsd.Timer,
+					Name:  "latency",
+					Value: float64(delta / time.Millisecond),
+				})
 		} else {
 			fmt.Println("Put failed: ", wo.err)
 			intervalStats.AddErrPut()
