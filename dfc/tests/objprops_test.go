@@ -423,15 +423,15 @@ func Test_objpropsVersionEnabled(t *testing.T) {
 	}
 
 	// Skip the test when given a local bucket
-	versionEnabled := true
-	server, err := client.HeadBucket(proxyurl, clibucket)
+	props, err := client.HeadBucket(proxyurl, clibucket)
 	if err != nil {
 		t.Errorf("Could not execute HeadBucket Request: %v", err)
 		return
 	}
-	if server == "dfc" {
+	if props.CloudProvider == "dfc" {
 		isLocalBucket = true
 	}
+	versionEnabled := props.VersioningEnabled
 
 	propsMainTest(t, versionEnabled, isLocalBucket)
 
