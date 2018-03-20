@@ -45,7 +45,7 @@ const (
 
 // Header Key enum
 const (
-	CloudProvider         = "Server"                // Server: from Cloud Provider enum
+	CloudProvider         = "CloudProvider"         // from Cloud Provider enum
 	Versioning            = "Versioning"            // Versioning state for a bucket: "enabled"/"disabled"
 	HeaderDfcChecksumType = "HeaderDfcChecksumType" // Checksum Type (xxhash, md5, none)
 	HeaderDfcChecksumVal  = "HeaderDfcChecksumVal"  // Checksum Value
