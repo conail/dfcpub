@@ -373,7 +373,7 @@ func HeadBucket(proxyurl, bucket string) (server string, err error) {
 		err = fmt.Errorf("Head bucket %s failed, HTTP status %d", bucket, r.StatusCode)
 		return
 	}
-	server = r.Header.Get("Server")
+	server = r.Header.Get(dfc.CloudProvider)
 	return
 }
 

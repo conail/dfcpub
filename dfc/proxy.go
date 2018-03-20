@@ -174,7 +174,7 @@ func (p *proxyrunner) httpfilget(w http.ResponseWriter, r *http.Request) {
 		p.invalmsghdlr(w, r, errstr)
 		return
 	}
-	redirecturl := fmt.Sprintf("%s%s?%s=false", si.DirectURL, r.URL.Path, ParamLocal)
+	redirecturl := fmt.Sprintf("%s%s?%s=%t", si.DirectURL, r.URL.Path, ParamLocal, p.islocalBucket(bucket))
 	if glog.V(3) {
 		glog.Infof("Redirecting %q to %s (%s)", r.URL.Path, si.DirectURL, r.Method)
 	}
@@ -484,7 +484,7 @@ func (p *proxyrunner) httpfilput(w http.ResponseWriter, r *http.Request) {
 		p.invalmsghdlr(w, r, errstr)
 		return
 	}
-	redirecturl := si.DirectURL + r.URL.Path
+	redirecturl := fmt.Sprintf("%s%s?%s=%t", si.DirectURL, r.URL.Path, ParamLocal, p.islocalBucket(bucket))
 	if glog.V(3) {
 		glog.Infof("Redirecting %q to %s (%s)", r.URL.Path, si.DirectURL, r.Method)
 	}

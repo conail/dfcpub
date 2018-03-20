@@ -354,6 +354,8 @@ func (t *targetrunner) prefetchMissing(objname, bucket string) {
 	versioncfg := &ctx.config.VersionConfig
 	fqn := t.fqn(bucket, objname)
 	uname := bucket + objname
+	// FIXME: Use ParamLocal from HTTP request? Other functions in this module uses simple t.islocalBucket() call
+	islocal := t.islocalBucket(bucket)
 	//
 	// step 1: do not take the lock to prevent get from starving
 	// from repeated prefetches on the same cached file
@@ -363,7 +365,7 @@ func (t *targetrunner) prefetchMissing(objname, bucket string) {
 		t.statsif.add("numerr", 1)
 		return
 	}
-	if !coldget && versioncfg.ValidateWarmGet && version != "" && t.bucketVersionSupported(bucket) {
+	if !coldget && !islocal && versioncfg.ValidateWarmGet && version != "" && bucketVersionSupported(bucket, islocal) {
 		if vchanged, errstr, _ = t.checkCloudVersion(bucket, objname, version); errstr != "" {
 			return
 		}
@@ -382,7 +384,7 @@ func (t *targetrunner) prefetchMissing(objname, bucket string) {
 		t.statsif.add("numerr", 1)
 		return
 	}
-	if !coldget && versioncfg.ValidateWarmGet && version != "" && t.bucketVersionSupported(bucket) {
+	if !coldget && !islocal && versioncfg.ValidateWarmGet && version != "" && bucketVersionSupported(bucket, islocal) {
 		if vchanged, errstr, _ = t.checkCloudVersion(bucket, objname, version); errstr != "" {
 			return
 		}

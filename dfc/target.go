@@ -209,16 +209,6 @@ func (t *targetrunner) filehdlr(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// bucketVersionSupported returns if DFC supports versioning for the bucket
-func (t *targetrunner) bucketVersionSupported(bucket string) bool {
-	versioning := ctx.config.VersionConfig.Versioning
-	if t.islocalBucket(bucket) {
-		return versioning == VersionAll || versioning == VersionLocal
-	}
-
-	return versioning == VersionAll || versioning == VersionCloud
-}
-
 // checkCloudVersion returns if versions of an object differ in Cloud and DFC cache
 // and the object should be refreshed from Cloud storage
 // It should be called only in case of the object is present in DFC cache
@@ -273,6 +263,12 @@ func (t *targetrunner) httpfilget(w http.ResponseWriter, r *http.Request) {
 		t.listbucket(w, r, bucket)
 		return
 	}
+
+	islocal, errstr, errcode := t.checkLocalQueryParameter(bucket, r)
+	if errstr != "" {
+		t.invalmsghdlr(w, r, errstr, errcode)
+		return
+	}
 	//
 	// serialize on the name
 	//
@@ -289,7 +285,7 @@ func (t *targetrunner) httpfilget(w http.ResponseWriter, r *http.Request) {
 	}
 	// FIXME - TODO: split ValidateWarmGet into a) validate and b) get new if invalid
 	// the second flag controls whether the original request blocks on version update
-	if !coldget && versioncfg.ValidateWarmGet && version != "" && t.bucketVersionSupported(bucket) {
+	if !coldget && !islocal && versioncfg.ValidateWarmGet && version != "" && bucketVersionSupported(bucket, islocal) {
 		if vchanged, errstr, errcode = t.checkCloudVersion(bucket, objname, version); errstr != "" {
 			t.invalmsghdlr(w, r, errstr, errcode)
 			return
@@ -559,6 +555,13 @@ func (t *targetrunner) doLocalBucketList(w http.ResponseWriter, r *http.Request,
 				entry.Atime = fi.atime.Format(msg.GetTimeFormat)
 			}
 		}
+		if strings.Contains(msg.GetProps, GetPropsVersion) {
+			fqn := t.fqn(bucket, fi.relname)
+			version, errstr := Getxattr(fqn, xattrObjVersion)
+			if errstr == "" {
+				entry.Version = string(version)
+			}
+		}
 		reslist.Entries = append(reslist.Entries, entry)
 	}
 	jsbytes, err := json.Marshal(reslist)
@@ -717,6 +720,7 @@ func (t *targetrunner) httpfilput(w http.ResponseWriter, r *http.Request) {
 	if len(apitems) > 1 {
 		objname = strings.Join(apitems[1:], "/")
 	}
+
 	if from != "" && to != "" {
 		// Rebalance: "/"+Rversion+"/"+Rfiles + "/"+bucket+"/"+objname+"?from_id="+from_id+"&to_id="+to_id
 		if objname == "" {
@@ -754,6 +758,13 @@ func (t *targetrunner) doput(w http.ResponseWriter, r *http.Request, bucket, obj
 		htype, hval, nhtype, nhval string
 		sgl                        *SGLIO
 	)
+
+	islocal, errstr, errcode := t.checkLocalQueryParameter(bucket, r)
+	if errstr != "" {
+		t.invalmsghdlr(w, r, errstr, errcode)
+		return
+	}
+
 	cksumcfg := &ctx.config.CksumConfig
 	fqn := t.fqn(bucket, objname)
 	putfqn := fmt.Sprintf("%s.%d", fqn, time.Now().UnixNano())
@@ -808,14 +819,14 @@ func (t *targetrunner) doput(w http.ResponseWriter, r *http.Request, bucket, obj
 	// commit
 	props := &objectProps{nhobj: nhobj}
 	if sgl == nil {
-		return t.putCommit(bucket, objname, putfqn, fqn, props, false)
+		return t.putCommit(bucket, objname, putfqn, fqn, props, false /*rebalance*/, islocal)
 	}
 	// FIXME: AA: use xaction
-	go t.sglToCloudAsync(sgl, bucket, objname, putfqn, fqn, props)
+	go t.sglToCloudAsync(sgl, bucket, objname, putfqn, fqn, props, islocal)
 	return
 }
 
-func (t *targetrunner) sglToCloudAsync(sgl *SGLIO, bucket, objname, putfqn, fqn string, objprops *objectProps) {
+func (t *targetrunner) sglToCloudAsync(sgl *SGLIO, bucket, objname, putfqn, fqn string, objprops *objectProps, islocal bool) {
 	slab := selectslab(sgl.Size())
 	buf := slab.alloc()
 	defer func() {
@@ -849,7 +860,7 @@ func (t *targetrunner) sglToCloudAsync(sgl *SGLIO, bucket, objname, putfqn, fqn 
 		}
 		return
 	}
-	errstr, _ := t.putCommit(bucket, objname, putfqn, fqn, objprops, false)
+	errstr, _ := t.putCommit(bucket, objname, putfqn, fqn, objprops, false /*rebalance*/, islocal)
 	if errstr != "" {
 		glog.Errorln("sglToCloudAsync: commit", errstr)
 		return
@@ -858,7 +869,7 @@ func (t *targetrunner) sglToCloudAsync(sgl *SGLIO, bucket, objname, putfqn, fqn 
 }
 
 func (t *targetrunner) putCommit(bucket, objname, putfqn, fqn string,
-	objprops *objectProps, rebalance bool) (errstr string, errcode int) {
+	objprops *objectProps, rebalance bool, isBucketLocal bool) (errstr string, errcode int) {
 	var (
 		file *os.File
 		err  error
@@ -871,7 +882,7 @@ func (t *targetrunner) putCommit(bucket, objname, putfqn, fqn string,
 		}
 	}()
 	// cloud
-	if !t.islocalBucket(bucket) && !rebalance {
+	if !isBucketLocal && !rebalance {
 		if file, err = os.Open(putfqn); err != nil {
 			errstr = fmt.Sprintf("Failed to reopen %s err: %v", putfqn, err)
 			return
@@ -888,7 +899,7 @@ func (t *targetrunner) putCommit(bucket, objname, putfqn, fqn string,
 	}
 
 	//FIXME: autoincremental version for local buckets
-	if t.islocalBucket(bucket) && t.bucketVersionSupported(bucket) {
+	if isBucketLocal && bucketVersionSupported(bucket, isBucketLocal) {
 		objprops.version = "1"
 	}
 
@@ -922,6 +933,10 @@ func (t *targetrunner) dorebalance(r *http.Request, from, to, bucket, objname st
 		return
 	}
 	fqn := t.fqn(bucket, objname)
+	islocal, errstr, _ := t.checkLocalQueryParameter(bucket, r)
+	if errstr != "" {
+		return
+	}
 
 	if t.si.DaemonID == from {
 		//
@@ -982,7 +997,7 @@ func (t *targetrunner) dorebalance(r *http.Request, from, to, bucket, objname st
 				return
 			}
 		}
-		errstr, _ = t.putCommit(bucket, objname, putfqn, fqn, props, true)
+		errstr, _ = t.putCommit(bucket, objname, putfqn, fqn, props, true /*rebalance*/, islocal)
 	}
 	return
 }
@@ -1328,7 +1343,7 @@ func (t *targetrunner) httpfilhead(w http.ResponseWriter, r *http.Request) {
 
 	}
 	// double check if we support versioning internally for the bucket
-	if !t.bucketVersionSupported(bucket) {
+	if !bucketVersionSupported(bucket, islocal) {
 		bucketprops[Versioning] = VersioningDisabled
 	}
 
@@ -1771,7 +1786,6 @@ func (t *targetrunner) receive(fqn string, inmem bool, objname, omd5 string, oho
 	return
 }
 
-// FIXME VERSION: who to check bucket locality and use 'version' property?
 func finalizeobj(fqn string, objprops *objectProps) (errstr string) {
 	if objprops.nhobj != nil {
 		htype, hval := objprops.nhobj.get()
@@ -1784,4 +1798,14 @@ func finalizeobj(fqn string, objprops *objectProps) (errstr string) {
 		errstr = Setxattr(fqn, xattrObjVersion, []byte(objprops.version))
 	}
 	return
+}
+
+// bucketVersionSupported returns if DFC supports versioning for the bucket
+func bucketVersionSupported(bucket string, islocal bool) bool {
+	versioning := ctx.config.VersionConfig.Versioning
+	if islocal {
+		return versioning == VersionAll || versioning == VersionLocal
+	}
+
+	return versioning == VersionAll || versioning == VersionCloud
 }
