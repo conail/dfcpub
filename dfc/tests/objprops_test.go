@@ -410,7 +410,6 @@ func Test_objpropsVersionEnabled(t *testing.T) {
 		chkVersion    = true
 		versioning    = "all"
 		isLocalBucket = false
-		// versioning = "none"
 	)
 	config := getConfig(proxyurl+"/v1/daemon", httpclient, t)
 	versionCfg := config["version_config"].(map[string]interface{})
@@ -431,7 +430,6 @@ func Test_objpropsVersionEnabled(t *testing.T) {
 		return
 	}
 	if server == "dfc" {
-		// t.Skipf("Version is unavailable for local bucket %s", clibucket)
 		isLocalBucket = true
 	}
 
