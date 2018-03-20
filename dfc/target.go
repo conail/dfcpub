@@ -1324,6 +1324,12 @@ func (t *targetrunner) httpfilhead(w http.ResponseWriter, r *http.Request) {
 	} else {
 		bucketprops = make(map[string]string)
 		bucketprops[CloudProvider] = dfclocal
+		bucketprops[Versioning] = VersioningEnabled
+
+	}
+	// double check if we support versioning internally for the bucket
+	if !t.bucketVersionSupported(bucket) {
+		bucketprops[Versioning] = VersioningDisabled
 	}
 
 	for k, v := range bucketprops {

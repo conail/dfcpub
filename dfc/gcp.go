@@ -154,7 +154,11 @@ func (gcpimpl *gcpimpl) headbucket(bucket string) (bucketprops map[string]string
 		return
 	}
 	bucketprops[CloudProvider] = googlecloud
-	bucketprops[VersioningEnabled] = fmt.Sprintf("%t", attrs.VersioningEnabled)
+	if attrs.VersioningEnabled {
+		bucketprops[Versioning] = VersioningEnabled
+	} else {
+		bucketprops[Versioning] = VersioningDisabled
+	}
 	return
 }
 

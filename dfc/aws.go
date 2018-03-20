@@ -177,8 +177,12 @@ func (awsimpl *awsimpl) headbucket(bucket string) (bucketprops map[string]string
 	if err != nil {
 		errcode = awsErrorToHTTP(err)
 		errstr = fmt.Sprintf("aws: The bucket %s either does not exist or is not accessible, err: %v", bucket, err)
-	} else if result.Status != nil {
-		bucketprops[VersioningEnabled] = fmt.Sprintf("%t", *result.Status == s3.BucketVersioningStatusEnabled)
+	} else {
+		if result.Status != nil && *result.Status == s3.BucketVersioningStatusEnabled {
+			bucketprops[Versioning] = VersioningEnabled
+		} else {
+			bucketprops[Versioning] = VersioningDisabled
+		}
 	}
 
 	return
