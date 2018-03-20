@@ -31,7 +31,7 @@ func propsStats(t *testing.T) (objChanged int64, bytesChanged int64) {
 }
 
 func propsUpdateObjects(t *testing.T, bucket string, oldVersions map[string]string, msgbytes []byte,
-	versionEnabled bool) (newVersions map[string]string) {
+	versionEnabled bool, isLocalBucket bool) (newVersions map[string]string) {
 	newVersions = make(map[string]string, len(oldVersions))
 	tlogf("Updating objects...\n")
 	r, err := readers.NewRandReader(int64(fileSize), true /* withHash */)
@@ -64,7 +64,7 @@ func propsUpdateObjects(t *testing.T, bucket string, oldVersions map[string]stri
 		tlogf("Object %s new version %s\n", m.Name, m.Version)
 		newVersions[m.Name] = m.Version
 
-		if !m.IsCached {
+		if !m.IsCached && !isLocalBucket {
 			t.Errorf("Object %s/%s is not marked as cached one", bucket, m.Name)
 		}
 		if !versionEnabled {
@@ -209,7 +209,7 @@ func propsRecacheObjects(t *testing.T, bucket string, objs map[string]string, ms
 	}
 }
 
-func propsRebalance(t *testing.T, bucket string, objects map[string]string, msgbytes []byte, versionEnabled bool) {
+func propsRebalance(t *testing.T, bucket string, objects map[string]string, msgbytes []byte, versionEnabled bool, isLocalBucket bool) {
 	propsCleanupObjects(t, bucket, objects)
 
 	smap := getClusterMap(httpclient, t)
@@ -230,7 +230,7 @@ func propsRebalance(t *testing.T, bucket string, objects map[string]string, msgb
 	tlogf("Target %s is removed\n", removedSid)
 
 	// rewrite objects and compare versions - they should change
-	newobjs := propsUpdateObjects(t, bucket, objects, msgbytes, versionEnabled)
+	newobjs := propsUpdateObjects(t, bucket, objects, msgbytes, versionEnabled, isLocalBucket)
 
 	tlogf("Reregistering target...\n")
 	registerTarget(removedSid, &smap, t)
@@ -269,7 +269,7 @@ func propsRebalance(t *testing.T, bucket string, objects map[string]string, msgb
 
 		objFound++
 
-		if !m.IsCached {
+		if !m.IsCached && !isLocalBucket {
 			t.Errorf("Object %s/%s is not marked as cached one", bucket, m.Name)
 		}
 		if m.Atime == "" {
@@ -303,35 +303,24 @@ func propsCleanupObjects(t *testing.T, bucket string, newVersions map[string]str
 	close(errch)
 }
 
-func propsMainTest(t *testing.T) {
+func propsMainTest(t *testing.T, versionEnabled bool, isLocalBucket bool) {
 	const objCountToTest = 15
 	var (
-		versionEnabled = true
-		filesput       = make(chan string, objCountToTest)
-		fileslist      = make(map[string]string, objCountToTest)
-		errch          = make(chan error, objCountToTest)
-		filesize       = uint64(1024 * 1024)
-		numPuts        = objCountToTest
-		bucket         = clibucket
-		versionDir     = "versionid"
-		sgl            *dfc.SGLIO
-		err            error
+		filesput   = make(chan string, objCountToTest)
+		fileslist  = make(map[string]string, objCountToTest)
+		errch      = make(chan error, objCountToTest)
+		filesize   = uint64(1024 * 1024)
+		numPuts    = objCountToTest
+		bucket     = clibucket
+		versionDir = "versionid"
+		sgl        *dfc.SGLIO
+		err        error
 	)
 
 	parse()
 	if usingSG {
 		sgl = dfc.NewSGLIO(filesize)
 		defer sgl.Free()
-	}
-
-	// Skip the test when given a local bucket
-	server, err := client.HeadBucket(proxyurl, clibucket)
-	if err != nil {
-		t.Errorf("Could not execute HeadBucket Request: %v", err)
-		return
-	}
-	if server == "dfc" {
-		t.Skipf("Version is unavailable for local bucket %s", clibucket)
 	}
 
 	// Create a few objects
@@ -365,23 +354,6 @@ func propsMainTest(t *testing.T) {
 		return
 	}
 
-	// detect if version is enabled on bucket
-	for _, m := range reslist.Entries {
-		if _, ok := fileslist[m.Name]; !ok {
-			continue
-		}
-		if m.Version == "" {
-			if server == "aws" {
-				t.Logf("AWS bucket %s has versioning disabled. Only iscached and atime tests ran", bucket)
-				versionEnabled = false
-			} else if server == "gcp" {
-				t.Error("GCP failed to read object version")
-				t.FailNow()
-			}
-		}
-		break
-	}
-
 	// PUT objects must have all properties set: atime, iscached, version
 	for _, m := range reslist.Entries {
 		if _, ok := fileslist[m.Name]; !ok {
@@ -389,7 +361,7 @@ func propsMainTest(t *testing.T) {
 		}
 		tlogf("Intial version %s - %v\n", m.Name, m.Version)
 
-		if !m.IsCached {
+		if !m.IsCached && !isLocalBucket {
 			t.Errorf("Object %s/%s is not marked as cached one", bucket, m.Name)
 		}
 
@@ -410,7 +382,7 @@ func propsMainTest(t *testing.T) {
 	}
 
 	// rewrite objects and compare versions - they should change
-	newVersions := propsUpdateObjects(t, bucket, fileslist, jsbytes, versionEnabled)
+	newVersions := propsUpdateObjects(t, bucket, fileslist, jsbytes, versionEnabled, isLocalBucket)
 	if len(newVersions) != len(fileslist) {
 		t.Errorf("Number of objects mismatch. Expected: %d objects, after update: %d", len(fileslist), len(newVersions))
 	}
@@ -418,14 +390,16 @@ func propsMainTest(t *testing.T) {
 	// check that files are read from cache
 	propsReadObjects(t, bucket, fileslist)
 
-	// try to evict some files and check if they are gone
-	propsEvict(t, bucket, newVersions, jsbytes, versionEnabled)
+	if !isLocalBucket {
+		// try to evict some files and check if they are gone
+		propsEvict(t, bucket, newVersions, jsbytes, versionEnabled)
 
-	// read objects to put them to the cache. After that all objects must have iscached=true
-	propsRecacheObjects(t, bucket, newVersions, jsbytes, versionEnabled)
+		// read objects to put them to the cache. After that all objects must have iscached=true
+		propsRecacheObjects(t, bucket, newVersions, jsbytes, versionEnabled)
+	}
 
 	// test rebalance should keep object versions
-	propsRebalance(t, bucket, newVersions, jsbytes, versionEnabled)
+	propsRebalance(t, bucket, newVersions, jsbytes, versionEnabled, isLocalBucket)
 
 	// cleanup
 	propsCleanupObjects(t, bucket, newVersions)
@@ -433,8 +407,10 @@ func propsMainTest(t *testing.T) {
 
 func Test_objpropsVersionEnabled(t *testing.T) {
 	var (
-		chkVersion = true
-		versioning = "all"
+		chkVersion    = true
+		versioning    = "all"
+		isLocalBucket = false
+		// versioning = "none"
 	)
 	config := getConfig(proxyurl+"/v1/daemon", httpclient, t)
 	versionCfg := config["version_config"].(map[string]interface{})
@@ -447,7 +423,19 @@ func Test_objpropsVersionEnabled(t *testing.T) {
 		setConfig("versioning", dfc.VersionAll, proxyurl+"/v1/cluster", httpclient, t)
 	}
 
-	propsMainTest(t)
+	// Skip the test when given a local bucket
+	versionEnabled := true
+	server, err := client.HeadBucket(proxyurl, clibucket)
+	if err != nil {
+		t.Errorf("Could not execute HeadBucket Request: %v", err)
+		return
+	}
+	if server == "dfc" {
+		// t.Skipf("Version is unavailable for local bucket %s", clibucket)
+		isLocalBucket = true
+	}
+
+	propsMainTest(t, versionEnabled, isLocalBucket)
 
 	// restore configuration
 	if oldChkVersion != chkVersion {
