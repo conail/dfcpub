@@ -49,11 +49,11 @@ func min64(a, b int64) int64 {
 }
 
 func divCeil(a, b int64) int64 {
-	if d, r := a/b, a%b; r > 0 {
+	d, r := a/b, a%b
+	if r > 0 {
 		return d + 1
-	} else {
-		return d
 	}
+	return d
 }
 
 func copyStruct(dst interface{}, src interface{}) {
@@ -105,20 +105,20 @@ func CreateDir(dirname string) (err error) {
 	return
 }
 
-// NOTE: receives, flushes, and closes
-func ReceiveFile(file *os.File, rrbody io.Reader, buf []byte, hashes ...hash.Hash) (written int64, errstr string) {
+func ReceiveAndChecksum(filewriter io.Writer, rrbody io.Reader,
+	buf []byte, hashes ...hash.Hash) (written int64, errstr string) {
 	var (
 		writer io.Writer
 		err    error
 	)
 	if len(hashes) == 0 {
-		writer = file
+		writer = filewriter
 	} else {
 		hashwriters := make([]io.Writer, len(hashes)+1)
 		for i, h := range hashes {
 			hashwriters[i] = h.(io.Writer)
 		}
-		hashwriters[len(hashes)] = file
+		hashwriters[len(hashes)] = filewriter
 		writer = io.MultiWriter(hashwriters...)
 	}
 	if buf == nil {
@@ -132,21 +132,13 @@ func ReceiveFile(file *os.File, rrbody io.Reader, buf []byte, hashes ...hash.Has
 	return
 }
 
-func Createfile(fname string) (*os.File, error) {
-	var file *os.File
-	var err error
-	// strips the last part from filepath
+func CreateFile(fname string) (file *os.File, err error) {
 	dirname := filepath.Dir(fname)
 	if err = CreateDir(dirname); err != nil {
-		glog.Errorf("Failed to create local dir %s, err: %v", dirname, err)
-		return nil, err
+		return
 	}
 	file, err = os.Create(fname)
-	if err != nil {
-		glog.Errorf("Unable to create file %s, err: %v", fname, err)
-		return nil, err
-	}
-	return file, nil
+	return
 }
 
 func ComputeMD5(reader io.Reader, buf []byte, md5 hash.Hash) (csum string, errstr string) {
@@ -176,7 +168,7 @@ func ComputeXXHash(reader io.Reader, buf []byte, xx hash.Hash64) (csum string, e
 	}
 	hashIn64 := xx.Sum64()
 	hashInBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(hashInBytes, uint64(hashIn64))
+	binary.BigEndian.PutUint64(hashInBytes, hashIn64)
 	csum = hex.EncodeToString(hashInBytes)
 	return csum, ""
 }
@@ -210,7 +202,11 @@ type cksumvalmd5 struct {
 }
 
 func newcksumvalue(kind string, val string) cksumvalue {
-	if kind == "" || val == "" {
+	if kind == "" {
+		return nil
+	}
+	if val == "" {
+		glog.Infof("Warning: checksum %s: empty value", kind)
 		return nil
 	}
 	if kind == ChecksumXXHash {
@@ -286,4 +282,20 @@ func IsErrConnectionRefused(err error) (yes bool) {
 		}
 	}
 	return
+}
+
+// FIXME: usage
+// mentioned in the https://github.com/golang/go/issues/11745#issuecomment-123555313 thread
+// there must be a better way to handle this..
+func isSyscallWriteError(err error) bool {
+	switch e := err.(type) {
+	case *url.Error:
+		return isSyscallWriteError(e.Err)
+	case *net.OpError:
+		return e.Op == "write" && isSyscallWriteError(e.Err)
+	case *os.SyscallError:
+		return e.Syscall == "write"
+	default:
+		return false
+	}
 }

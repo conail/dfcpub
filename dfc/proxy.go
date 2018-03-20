@@ -160,41 +160,37 @@ func (p *proxyrunner) httpfilget(w http.ResponseWriter, r *http.Request) {
 		p.invalmsghdlr(w, r, errstr)
 		return
 	}
-
-	if len(objname) != 0 {
-		p.statsif.add("numget", 1)
-		si, errstr := hrwTarget(bucket+"/"+objname, ctx.smap)
-		if errstr != "" {
-			p.invalmsghdlr(w, r, errstr)
-			return
-		}
-		redirecturl := fmt.Sprintf("%s%s?%s=false", si.DirectURL, r.URL.Path, ParamLocal)
-		if glog.V(3) {
-			glog.Infof("Redirecting %q to %s (%s)", r.URL.Path, si.DirectURL, r.Method)
-		}
-		if !ctx.config.Proxy.Passthru && len(objname) > 0 {
-			glog.Infof("passthru=false: proxy initiates the GET %s/%s", bucket, objname)
-			p.receiveDrop(w, r, redirecturl) // ignore error, proceed to http redirect
-		}
-
-		http.Redirect(w, r, redirecturl, http.StatusMovedPermanently)
+	// listbucket
+	if len(objname) == 0 {
+		p.statsif.add("numlist", 1)
+		p.listbucket(w, r, bucket)
 		return
 	}
 
-	p.statsif.add("numlist", 1)
-	p.listbucket(w, r, bucket)
+	// GET
+	p.statsif.add("numget", 1)
+	si, errstr := hrwTarget(bucket+"/"+objname, ctx.smap)
+	if errstr != "" {
+		p.invalmsghdlr(w, r, errstr)
+		return
+	}
+	redirecturl := fmt.Sprintf("%s%s?%s=false", si.DirectURL, r.URL.Path, ParamLocal)
+	if glog.V(3) {
+		glog.Infof("Redirecting %q to %s (%s)", r.URL.Path, si.DirectURL, r.Method)
+	}
+	if !ctx.config.Proxy.Passthru && len(objname) > 0 {
+		glog.Infof("passthru=false: proxy initiates the GET %s/%s", bucket, objname)
+		p.receiveDrop(w, r, redirecturl) // ignore error, proceed to http redirect
+	}
+	http.Redirect(w, r, redirecturl, http.StatusMovedPermanently)
 }
 
 // For cached = false goes to the Cloud, otherwise returns locally cached files
-func (p *proxyrunner) targetListBucket(w http.ResponseWriter, r *http.Request, bucket string,
-	dinfo *daemonInfo, reqBody []byte, islocal bool, ch chan *bucketResp,
-	cached bool, wg *sync.WaitGroup) (response *bucketResp, err error) {
-	if wg != nil {
-		defer wg.Done()
-	}
-
-	url := fmt.Sprintf("%s/%s/%s/%s?%s=%v&%s=%v", dinfo.DirectURL, Rversion, Rfiles, bucket, ParamLocal, islocal, ParamCached, cached)
-	outjson, err, _, status := p.call(dinfo, url, r.Method, reqBody, ctx.config.HTTPTimeout)
+func (p *proxyrunner) targetListBucket(bucket string, dinfo *daemonInfo,
+	reqBody []byte, islocal bool, cached bool) (response *bucketResp, err error) {
+	url := fmt.Sprintf("%s/%s/%s/%s?%s=%v&%s=%v", dinfo.DirectURL, Rversion,
+		Rfiles, bucket, ParamLocal, islocal, ParamCached, cached)
+	outjson, err, _, status := p.call(dinfo, url, http.MethodGet, reqBody, ctx.config.HTTP.Timeout)
 	if err != nil {
 		p.kalive.onerr(err, status)
 	}
@@ -204,16 +200,13 @@ func (p *proxyrunner) targetListBucket(w http.ResponseWriter, r *http.Request, b
 		err:     err,
 		id:      dinfo.DaemonID,
 	}
-
-	if ch != nil {
-		ch <- response
-	}
 	return response, err
 }
 
 // Receives info about locally cached files from targets in batches
 // and merges with existing list of cloud files
-func (p *proxyrunner) consumeCachedList(bmap map[string]*BucketEntry, dataCh chan *cachedFileBatch, errch chan error, wg *sync.WaitGroup) error {
+func (p *proxyrunner) consumeCachedList(bmap map[string]*BucketEntry,
+	dataCh chan *cachedFileBatch, errch chan error, wg *sync.WaitGroup) {
 	if wg != nil {
 		defer wg.Done()
 	}
@@ -222,7 +215,8 @@ func (p *proxyrunner) consumeCachedList(bmap map[string]*BucketEntry, dataCh cha
 			if errch != nil {
 				errch <- rb.err
 			}
-			return rb.err
+			glog.Errorf("Failed to get information about file in DFC cache: %v", rb.err)
+			return
 		}
 		if rb.entries == nil || len(rb.entries) == 0 {
 			continue
@@ -236,15 +230,16 @@ func (p *proxyrunner) consumeCachedList(bmap map[string]*BucketEntry, dataCh cha
 			}
 		}
 	}
-
-	return nil
 }
 
 // Request list of all cached files from a target.
 // The target returns its list in batches `cachedPageSize` length
-func (p *proxyrunner) generateCachedList(w http.ResponseWriter, r *http.Request, bucket string,
-	daemon *daemonInfo, dataCh chan *cachedFileBatch, wg *sync.WaitGroup, msg GetMsg, islocal bool) error {
-	const cachedObjects = true
+func (p *proxyrunner) generateCachedList(bucket string, daemon *daemonInfo,
+	dataCh chan *cachedFileBatch, wg *sync.WaitGroup, msg GetMsg) {
+	const (
+		cachedObjects = true
+		islocal       = false
+	)
 	if wg != nil {
 		defer wg.Done()
 	}
@@ -254,7 +249,7 @@ func (p *proxyrunner) generateCachedList(w http.ResponseWriter, r *http.Request,
 		// changes every loop run
 		listmsgjson, err := json.Marshal(&msg)
 		assert(err == nil, err)
-		resp, err := p.targetListBucket(w, r, bucket, daemon, listmsgjson, islocal, nil, cachedObjects, nil)
+		resp, err := p.targetListBucket(bucket, daemon, listmsgjson, islocal, cachedObjects)
 		if err != nil {
 			if dataCh != nil {
 				dataCh <- &cachedFileBatch{
@@ -262,11 +257,12 @@ func (p *proxyrunner) generateCachedList(w http.ResponseWriter, r *http.Request,
 					err: err,
 				}
 			}
-			return err
+			glog.Errorf("Failed to get information about cached objects on target %v: %v", daemon.DaemonID, err)
+			return
 		}
 
 		if resp.outjson == nil || len(resp.outjson) == 0 {
-			return nil
+			return
 		}
 
 		entries := BucketList{Entries: make([]*BucketEntry, 0, 128)}
@@ -277,7 +273,8 @@ func (p *proxyrunner) generateCachedList(w http.ResponseWriter, r *http.Request,
 					err: err,
 				}
 			}
-			return err
+			glog.Errorf("Failed to unmarshall cached objects list from target %v: %v", daemon.DaemonID, err)
+			return
 		}
 
 		msg.GetPageMarker = entries.PageMarker
@@ -296,28 +293,28 @@ func (p *proxyrunner) generateCachedList(w http.ResponseWriter, r *http.Request,
 			break
 		}
 	}
-
-	return nil
 }
 
 // Get list of cached files from all targets and update the list
 // of files from cloud with local metadata (iscached, atime etc)
-func (p *proxyrunner) collectCachedFileList(w http.ResponseWriter, r *http.Request, bucket string,
-	fileList *BucketList, listmsgjson []byte, islocal bool) (err error) {
+func (p *proxyrunner) collectCachedFileList(bucket string, fileList *BucketList, getmsgjson []byte) (err error) {
+	reqParams := GetMsg{}
+	err = json.Unmarshal(getmsgjson, &reqParams)
+	if err != nil {
+		return
+	}
+
 	bucketMap := make(map[string]*BucketEntry, initialBucketListSize)
 	for _, entry := range fileList.Entries {
 		bucketMap[entry.Name] = entry
 	}
 
-	dataCh := make(chan *cachedFileBatch, len(ctx.smap.Smap))
+	dataCh := make(chan *cachedFileBatch, ctx.smap.count())
 	errch := make(chan error, 1)
 	wgConsumer := &sync.WaitGroup{}
 	wgConsumer.Add(1)
 	go p.consumeCachedList(bucketMap, dataCh, errch, wgConsumer)
 
-	reqParams := GetMsg{}
-	err = json.Unmarshal(listmsgjson, &reqParams)
-	assert(err == nil, err)
 	// since cached file page marker is not compatible with any cloud
 	// marker, it should be empty for the first call
 	reqParams.GetPageMarker = ""
@@ -325,7 +322,7 @@ func (p *proxyrunner) collectCachedFileList(w http.ResponseWriter, r *http.Reque
 	wg := &sync.WaitGroup{}
 	for _, daemon := range ctx.smap.Smap {
 		wg.Add(1)
-		go p.generateCachedList(w, r, bucket, daemon, dataCh, wg, reqParams, islocal)
+		go p.generateCachedList(bucket, daemon, dataCh, wg, reqParams)
 	}
 	wg.Wait()
 	close(dataCh)
@@ -344,16 +341,15 @@ func (p *proxyrunner) collectCachedFileList(w http.ResponseWriter, r *http.Reque
 	return
 }
 
-func (p *proxyrunner) getLocalBucketObjects(w http.ResponseWriter, r *http.Request,
-	bucket string, listmsgjson []byte) (allentries *BucketList, err error) {
-	var (
-		islocal      = true
-		cloudObjecst = false
-		resp         *bucketResp
+func (p *proxyrunner) getLocalBucketObjects(bucket string, listmsgjson []byte) (allentries *BucketList, err error) {
+	const (
+		islocal    = true
+		cachedObjs = false
 	)
+	var resp *bucketResp
 	allentries = &BucketList{Entries: make([]*BucketEntry, 0, initialBucketListSize)}
 	for _, si := range ctx.smap.Smap {
-		resp, err = p.targetListBucket(w, r, bucket, si, listmsgjson, islocal, nil, cloudObjecst, nil)
+		resp, err = p.targetListBucket(bucket, si, listmsgjson, islocal, cachedObjs)
 		if err != nil {
 			return
 		}
@@ -375,18 +371,22 @@ func (p *proxyrunner) getLocalBucketObjects(w http.ResponseWriter, r *http.Reque
 	return
 }
 
-func (p *proxyrunner) getCloudBucketObjects(w http.ResponseWriter, r *http.Request,
-	bucket string, listmsgjson []byte) (allentries *BucketList, err error) {
-	var (
+func (p *proxyrunner) getCloudBucketObjects(bucket string, listmsgjson []byte) (allentries *BucketList, err error) {
+	const (
 		islocal       = false
 		cachedObjects = false
-		resp          *bucketResp
 	)
+	var resp *bucketResp
 	allentries = &BucketList{Entries: make([]*BucketEntry, 0, initialBucketListSize)}
+	msg := GetMsg{}
+	err = json.Unmarshal(listmsgjson, &msg)
+	if err != nil {
+		return
+	}
 
 	// first, get the cloud object list from a random target
 	for _, si := range ctx.smap.Smap {
-		resp, err = p.targetListBucket(w, r, bucket, si, listmsgjson, islocal, nil, cachedObjects, nil)
+		resp, err = p.targetListBucket(bucket, si, listmsgjson, islocal, cachedObjects)
 		if err != nil {
 			return
 		}
@@ -403,14 +403,11 @@ func (p *proxyrunner) getCloudBucketObjects(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	msg := GetMsg{}
-	err = json.Unmarshal(listmsgjson, &msg)
-	assert(err == nil, err)
 	if strings.Contains(msg.GetProps, GetPropsAtime) ||
 		strings.Contains(msg.GetProps, GetPropsIsCached) {
 		// Now add local properties to the cloud objects
 		// The call replaces allentries.Entries with new values
-		err = p.collectCachedFileList(w, r, bucket, allentries, listmsgjson, islocal)
+		err = p.collectCachedFileList(bucket, allentries, listmsgjson)
 	}
 	return
 }
@@ -430,9 +427,9 @@ func (p *proxyrunner) listbucket(w http.ResponseWriter, r *http.Request, bucket 
 		return
 	}
 	if p.islocalBucket(bucket) {
-		allentries, err = p.getLocalBucketObjects(w, r, bucket, listmsgjson)
+		allentries, err = p.getLocalBucketObjects(bucket, listmsgjson)
 	} else {
-		allentries, err = p.getCloudBucketObjects(w, r, bucket, listmsgjson)
+		allentries, err = p.getCloudBucketObjects(bucket, listmsgjson)
 	}
 	if err != nil {
 		p.invalmsghdlr(w, r, err.Error())
@@ -440,7 +437,7 @@ func (p *proxyrunner) listbucket(w http.ResponseWriter, r *http.Request, bucket 
 	}
 	jsbytes, err := json.Marshal(allentries)
 	assert(err == nil, err)
-	_ = p.writeJSON(w, r, jsbytes, "listbucket")
+	p.writeJSON(w, r, jsbytes, "listbucket")
 }
 
 // receiveDrop reads until EOF and uses dummy writer (ReadToNull)
@@ -464,7 +461,6 @@ func (p *proxyrunner) receiveDrop(w http.ResponseWriter, r *http.Request, redire
 	if glog.V(3) {
 		glog.Infof("Received and discarded %q (size %.2f MB)", redirecturl, float64(bytes)/1000/1000)
 	}
-	return
 }
 
 // PUT "/"+Rversion+"/"+Rfiles
@@ -523,8 +519,6 @@ func (p *proxyrunner) httpfildelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := p.readJSON(w, r, &msg); err != nil {
-		s := fmt.Sprintf("Could not read JSON Body: %v", err)
-		p.invalmsghdlr(w, r, s)
 		return
 	}
 	p.statsif.add("numdelete", 1)
@@ -759,7 +753,7 @@ func (p *proxyrunner) httpdaeget(w http.ResponseWriter, r *http.Request) {
 	case GetWhatConfig:
 		jsbytes, err := json.Marshal(ctx.config)
 		assert(err == nil)
-		_ = p.writeJSON(w, r, jsbytes, "httpdaeget")
+		p.writeJSON(w, r, jsbytes, "httpdaeget")
 	default:
 		s := fmt.Sprintf("Unexpected GetMsg <- JSON [%v]", msg)
 		p.invalmsghdlr(w, r, s)
@@ -824,7 +818,7 @@ func (p *proxyrunner) httpcluget(w http.ResponseWriter, r *http.Request) {
 	case GetWhatSmap:
 		jsbytes, err := json.Marshal(ctx.smap)
 		assert(err == nil, err)
-		_ = p.writeJSON(w, r, jsbytes, "httpcluget")
+		p.writeJSON(w, r, jsbytes, "httpcluget")
 	case GetWhatStats:
 		getstatsmsg, err := json.Marshal(msg) // same message to all targets
 		assert(err == nil, err)
@@ -859,7 +853,7 @@ func (p *proxyrunner) httpclugetstats(w http.ResponseWriter, r *http.Request, ge
 	jsbytes, err := json.Marshal(out)
 	rr.Unlock()
 	assert(err == nil, err)
-	_ = p.writeJSON(w, r, jsbytes, "httpclugetstats")
+	p.writeJSON(w, r, jsbytes, "httpclugetstats")
 }
 
 // register|keepalive target
@@ -1022,7 +1016,6 @@ func (p *proxyrunner) synchronizeMaps(ntargets int, action string) {
 	p.lbmap.lock()
 	lbversion := p.lbmap.version()
 	smapversion := ctx.smap.version()
-	ntargets_cur := ctx.smap.count()
 	delay := syncmapsdelay
 	if lbversion == p.lbmap.syncversion && smapversion == ctx.smap.syncversion {
 		glog.Infof("Smap (v%d) and lbmap (v%d) are already in sync with the targets",
@@ -1046,12 +1039,10 @@ func (p *proxyrunner) synchronizeMaps(ntargets int, action string) {
 			smapversion = smv
 			// if provided, use ntargets as a hint
 			if startingUp {
-				ctx.smap.lock()
-				ntargets_cur = ctx.smap.count()
-				ctx.smap.unlock()
-				if ntargets_cur >= ntargets {
+				ntargetsCur := ctx.smap.countLocked()
+				if ntargetsCur >= ntargets {
 					glog.Infof("Reached the expected number %d (%d) of target registrations",
-						ntargets, ntargets_cur)
+						ntargets, ntargetsCur)
 					glog.Flush()
 				}
 			} else {
@@ -1063,14 +1054,14 @@ func (p *proxyrunner) synchronizeMaps(ntargets int, action string) {
 		// change in the cluster map warrants the broadcast of every other config that
 		// must be shared across the cluster;
 		// the opposite it not true though, that's why the check below
-		p.httpfilput_lb()
+		p.httpfilputLB()
 		if action == Rebalance {
-			p.httpcluput_smap(Rebalance) // REST cmd
+			p.httpcluputSmap(Rebalance) // REST cmd
 		} else if ctx.smap.syncversion != smapversion {
 			if startingUp {
-				p.httpcluput_smap(Rsyncsmap)
+				p.httpcluputSmap(Rsyncsmap)
 			} else {
-				p.httpcluput_smap(Rebalance) // NOTE: auto-rebalance
+				p.httpcluputSmap(Rebalance) // NOTE: auto-rebalance
 			}
 		}
 		break
@@ -1084,7 +1075,7 @@ func (p *proxyrunner) synchronizeMaps(ntargets int, action string) {
 	glog.Infof("Smap (v%d) and lbmap (v%d) are now in sync with the targets", smapversion, lbversion)
 }
 
-func (p *proxyrunner) httpcluput_smap(action string) {
+func (p *proxyrunner) httpcluputSmap(action string) {
 	method := http.MethodPut
 	assert(action == Rebalance || action == Rsyncsmap)
 	ctx.smap.lock()
@@ -1101,7 +1092,7 @@ func (p *proxyrunner) httpcluput_smap(action string) {
 	}
 }
 
-func (p *proxyrunner) httpfilput_lb() {
+func (p *proxyrunner) httpfilputLB() {
 	p.lbmap.lock()
 	jsbytes, err := json.Marshal(p.lbmap)
 	assert(err == nil, err)

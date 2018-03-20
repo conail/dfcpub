@@ -78,6 +78,21 @@ func (slab *slab) getsize() int64 {
 	return slab.fixedsize
 }
 
+//===========
+//
+// client API
+//
+//===========
+func AllocFromSlab(desiredsize int64) ([]byte, interface{}) {
+	slabif := selectslab(desiredsize)
+	return slabif.alloc(), slabif
+}
+
+func FreeToSlab(buf []byte, handle interface{}) {
+	slabif := handle.(slabif)
+	slabif.free(buf)
+}
+
 //======================================================================
 //
 // Reader and (streaming) Writer on top of a Scatter Gather List (SGL) of reusable buffers
@@ -97,14 +112,15 @@ func NewSGLIO(oosize uint64) *SGLIO {
 	}
 	slab := selectslab(osize)
 	n := divCeil(osize, slab.getsize())
-	sgl := make([][]byte, n, n)
+	sgl := make([][]byte, n)
 	for i := 0; i < int(n); i++ {
 		sgl[i] = slab.alloc()
 	}
 	return &SGLIO{sgl: sgl, slab: slab}
 }
 
-func (z *SGLIO) Cap() int64 { return int64(len(z.sgl)) * z.slab.getsize() }
+func (z *SGLIO) Cap() int64  { return int64(len(z.sgl)) * z.slab.getsize() }
+func (z *SGLIO) Size() int64 { return z.woff }
 
 func (z *SGLIO) grow(tosize int64) {
 	for z.Cap() < tosize {
