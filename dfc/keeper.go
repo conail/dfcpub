@@ -15,10 +15,11 @@ import (
 	"github.com/golang/glog"
 )
 
+var kalivetimeout = time.Second * 10
+
 const (
-	proxypollival = time.Second * 3
-	targetpollivl = time.Second * 10
-	kalivetimeout = time.Second * 2
+	proxypollival = time.Second * 30
+	targetpollivl = time.Second * 60
 	proxypollmaxc = 3
 )
 
@@ -187,6 +188,7 @@ func (r *proxykalive) poll(si *daemonInfo, url string, jsbytes []byte) (responde
 				return true, false
 			}
 			if IsErrConnectionRefused(err) || status == http.StatusRequestTimeout {
+				kalivetimeout = 2 * kalivetimeout
 				continue
 			}
 			glog.Warningf("keepalive: Unexpected status %d, err: %v", status, err)
