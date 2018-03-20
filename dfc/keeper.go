@@ -16,9 +16,9 @@ import (
 )
 
 const (
-	proxypollival = time.Second * 3
-	targetpollivl = time.Second * 10
-	kalivetimeout = time.Second * 2
+	proxypollival = time.Second * 30
+	targetpollivl = time.Second * 60
+	kalivetimeout = time.Second * 10
 	proxypollmaxc = 3
 )
 
@@ -156,7 +156,7 @@ func (r *proxykalive) keepalive(err error) (stopped bool) {
 		} else {
 			glog.Infof("Warning: target %s fails keepalive, err: %v", sid, err)
 		}
-		responded, stopped := r.poll(si, url, jsbytes)
+		responded, stopped := r.poll(si, url, jsbytes, kalivetimeout)
 		if stopped {
 			return true
 		}
@@ -176,17 +176,18 @@ func (r *proxykalive) keepalive(err error) (stopped bool) {
 	return false
 }
 
-func (r *proxykalive) poll(si *daemonInfo, url string, jsbytes []byte) (responded, stopped bool) {
+func (r *proxykalive) poll(si *daemonInfo, url string, jsbytes []byte, lkalivetimeout time.Duration) (responded, stopped bool) {
 	poller := time.NewTicker(proxypollival)
 	defer poller.Stop()
 	for i := 0; i < proxypollmaxc; i++ {
 		select {
 		case <-poller.C:
-			_, err, _, status := r.p.call(si, url, http.MethodGet, jsbytes, kalivetimeout)
+			_, err, _, status := r.p.call(si, url, http.MethodGet, jsbytes, lkalivetimeout)
 			if err == nil {
 				return true, false
 			}
 			if IsErrConnectionRefused(err) || status == http.StatusRequestTimeout {
+				lkalivetimeout = 2 * lkalivetimeout
 				continue
 			}
 			glog.Warningf("keepalive: Unexpected status %d, err: %v", status, err)
