@@ -32,7 +32,7 @@
 	},
 	"version_config": {
 		"validate_warm_get":	false,
-		"version": "all"
+		"versioning": "all"
 	},
 	"lru_config": {
 		"lowwm":		75,

@@ -303,12 +303,10 @@ func propsCleanupObjects(t *testing.T, bucket string, newVersions map[string]str
 	close(errch)
 }
 
-func Test_objprops(t *testing.T) {
+func propsMainTest(t *testing.T) {
 	const objCountToTest = 15
 	var (
-		oldChkVersion  bool
 		versionEnabled = true
-		chkVersion     = true
 		filesput       = make(chan string, objCountToTest)
 		fileslist      = make(map[string]string, objCountToTest)
 		errch          = make(chan error, objCountToTest)
@@ -334,13 +332,6 @@ func Test_objprops(t *testing.T) {
 	}
 	if server == "dfc" {
 		t.Skipf("Version is unavailable for local bucket %s", clibucket)
-	}
-
-	config := getConfig(proxyurl+"/v1/daemon", httpclient, t)
-	versionCfg := config["version_config"].(map[string]interface{})
-	oldChkVersion = versionCfg["validate_warm_get"].(bool)
-	if oldChkVersion != chkVersion {
-		setConfig("validate_warm_get", fmt.Sprintf("%v", chkVersion), proxyurl+"/v1/cluster", httpclient, t)
 	}
 
 	// Create a few objects
@@ -438,9 +429,31 @@ func Test_objprops(t *testing.T) {
 
 	// cleanup
 	propsCleanupObjects(t, bucket, newVersions)
+}
+
+func Test_objpropsVersionEnabled(t *testing.T) {
+	var (
+		chkVersion = true
+		versioning = "all"
+	)
+	config := getConfig(proxyurl+"/v1/daemon", httpclient, t)
+	versionCfg := config["version_config"].(map[string]interface{})
+	oldChkVersion := versionCfg["validate_warm_get"].(bool)
+	oldVersioning := versionCfg["versioning"].(string)
+	if oldChkVersion != chkVersion {
+		setConfig("validate_warm_get", fmt.Sprintf("%v", chkVersion), proxyurl+"/v1/cluster", httpclient, t)
+	}
+	if oldVersioning != dfc.VersionAll {
+		setConfig("versioning", dfc.VersionAll, proxyurl+"/v1/cluster", httpclient, t)
+	}
+
+	propsMainTest(t)
 
 	// restore configuration
 	if oldChkVersion != chkVersion {
 		setConfig("validate_warm_get", fmt.Sprintf("%v", oldChkVersion), proxyurl+"/v1/cluster", httpclient, t)
+	}
+	if oldVersioning != versioning {
+		setConfig("versioning", oldVersioning, proxyurl+"/v1/cluster", httpclient, t)
 	}
 }

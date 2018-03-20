@@ -209,6 +209,16 @@ func (t *targetrunner) filehdlr(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// bucketVersionSupported returns if DFC supports versioning for the bucket
+func (t *targetrunner) bucketVersionSupported(bucket string) bool {
+	versioning := ctx.config.VersionConfig.Versioning
+	if t.islocalBucket(bucket) {
+		return versioning == VersionAll || versioning == VersionLocal
+	}
+
+	return versioning == VersionAll || versioning == VersionCloud
+}
+
 // checkCloudVersion returns if versions of an object differ in Cloud and DFC cache
 // and the object should be refreshed from Cloud storage
 // It should be called only in case of the object is present in DFC cache
@@ -279,7 +289,7 @@ func (t *targetrunner) httpfilget(w http.ResponseWriter, r *http.Request) {
 	}
 	// FIXME - TODO: split ValidateWarmGet into a) validate and b) get new if invalid
 	// the second flag controls whether the original request blocks on version update
-	if !coldget && versioncfg.ValidateWarmGet && version != "" {
+	if !coldget && versioncfg.ValidateWarmGet && version != "" && t.bucketVersionSupported(bucket) {
 		if vchanged, errstr, errcode = t.checkCloudVersion(bucket, objname, version); errstr != "" {
 			t.invalmsghdlr(w, r, errstr, errcode)
 			return
@@ -876,6 +886,12 @@ func (t *targetrunner) putCommit(bucket, objname, putfqn, fqn string,
 			return
 		}
 	}
+
+	//FIXME: autoincremental version for local buckets
+	if t.islocalBucket(bucket) && t.bucketVersionSupported(bucket) {
+		objprops.version = "1"
+	}
+
 	// when all set and done:
 	if errstr = t.putSafeRename(bucket, objname, putfqn, fqn); errstr != "" {
 		return
@@ -1749,13 +1765,16 @@ func (t *targetrunner) receive(fqn string, inmem bool, objname, omd5 string, oho
 	return
 }
 
+// FIXME VERSION: who to check bucket locality and use 'version' property?
 func finalizeobj(fqn string, objprops *objectProps) (errstr string) {
 	if objprops.nhobj != nil {
 		htype, hval := objprops.nhobj.get()
 		assert(htype == ChecksumXXHash)
-		errstr = Setxattr(fqn, xattrXXHashVal, []byte(hval))
+		if errstr = Setxattr(fqn, xattrXXHashVal, []byte(hval)); errstr != "" {
+			return errstr
+		}
 	}
-	if errstr == "" && objprops.version != "" {
+	if objprops.version != "" {
 		errstr = Setxattr(fqn, xattrObjVersion, []byte(objprops.version))
 	}
 	return

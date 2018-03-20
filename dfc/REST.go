@@ -40,6 +40,7 @@ const (
 // Header Key enum
 const (
 	CloudProvider         = "Server"                // Server: from Cloud Provider enum
+	VersioningEnabled     = "VersioningEnabled"     // Versioning enabled on the Cloud
 	HeaderDfcChecksumType = "HeaderDfcChecksumType" // Checksum Type (xxhash, md5, none)
 	HeaderDfcChecksumVal  = "HeaderDfcChecksumVal"  // Checksum Value
 	HeaderDfcObjVersion   = "HeaderDfcObjVersion"   // Object version/generation

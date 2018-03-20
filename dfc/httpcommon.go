@@ -406,6 +406,12 @@ func (h *httprunner) setconfig(name, value string) (errstr string) {
 		} else {
 			return fmt.Sprintf("Invalid %s type %s - expecting %s or %s", name, value, ChecksumXXHash, ChecksumNone)
 		}
+	case "versioning":
+		if err := validateVersion(value); err == nil {
+			ctx.config.VersionConfig.Versioning = value
+		} else {
+			return err.Error()
+		}
 	default:
 		errstr = fmt.Sprintf("Cannot set config var %s - is readonly or unsupported", name)
 	}

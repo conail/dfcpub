@@ -147,13 +147,14 @@ func (gcpimpl *gcpimpl) headbucket(bucket string) (bucketprops map[string]string
 	if errstr != "" {
 		return
 	}
-	_, err := client.Bucket(bucket).Attrs(gctx)
+	attrs, err := client.Bucket(bucket).Attrs(gctx)
 	if err != nil {
 		errcode = gcpErrorToHTTP(err)
 		errstr = fmt.Sprintf("gcp: Failed to get attributes (bucket %s), err: %v", bucket, err)
 		return
 	}
 	bucketprops[CloudProvider] = googlecloud
+	bucketprops[VersioningEnabled] = fmt.Sprintf("%t", attrs.VersioningEnabled)
 	return
 }
 
