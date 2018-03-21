@@ -27,6 +27,6 @@ RUN apt-get -y remove curl wget
 RUN mkdir /etc/dfc
 COPY dfc.json $CONFFILE
 WORKDIR $WORKDIR
-RUN git pull origin shri-k8timeout
+RUN git pull origin shri-docker
 ENTRYPOINT export DFCDAEMONID=`echo $HOSTNAME` && go run setup/dfc.go -config=$CONFFILE -role=$ROLE -ntargets=$TARGETS -alsologtostderr=true
 
