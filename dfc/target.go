@@ -898,9 +898,18 @@ func (t *targetrunner) putCommit(bucket, objname, putfqn, fqn string,
 		}
 	}
 
-	//FIXME: autoincremental version for local buckets
+	//FIXME: revisit autoincremeting version
 	if isBucketLocal && bucketVersionSupported(bucket, isBucketLocal) {
-		objprops.version = "1"
+		if version, errstr := Getxattr(fqn, xattrObjVersion); errstr == "" {
+			if currValue, err := strconv.Atoi(string(version)); err != nil {
+				objprops.version = "1"
+			} else {
+				objprops.version = fmt.Sprintf("%d", currValue+1)
+			}
+		} else {
+			// No file - use default initial version id
+			objprops.version = "1"
+		}
 	}
 
 	// when all set and done:

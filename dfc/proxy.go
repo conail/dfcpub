@@ -647,6 +647,7 @@ func (p *proxyrunner) actionlistrange(w http.ResponseWriter, r *http.Request, ac
 		return
 	}
 	bucket := apitems[0]
+	islocal := p.islocalBucket(bucket)
 	wait := false
 	if jsmap, ok := actionMsg.Value.(map[string]interface{}); !ok {
 		s := fmt.Sprintf("Failed to unmarshal JSMAP: Not a map[string]interface")
@@ -683,7 +684,7 @@ func (p *proxyrunner) actionlistrange(w http.ResponseWriter, r *http.Request, ac
 				err     error
 				errstr  string
 				errcode int
-				url     = si.DirectURL + "/" + Rversion + "/" + Rfiles + "/" + bucket
+				url     = si.DirectURL + "/" + Rversion + "/" + Rfiles + "/" + bucket + fmt.Sprintf("?%s=%t", ParamLocal, islocal)
 			)
 			if wait {
 				_, err, errstr, errcode = p.call(si, url, method, jsonbytes, 0)
