@@ -98,14 +98,12 @@ if ! [[ "$testfspathcnt" =~ ^[0-9]+$ ]] ; then
 fi
 
 TESTFSPATHCOUNT=0
-FSPATH1="/usr/nvidia/data/1"
-FSPATH2="/usr/nvidia/data/2"
-FSPATH3="/usr/nvidia/data/3"
-FSPATH4="/usr/nvidia/data/4"
-FSPATH5="/usr/nvidia/data/5"
-FSPATH6="/usr/nvidia/data/6"
-FSPATH7="/usr/nvidia/data/7"
-FSPATH8="/usr/nvidia/data/8"
+i=1
+while [ $i -le $testfspathcnt ]
+do
+export FSPATH$i="/usr/nvidia/data/$i"
+i=$(( i + 1))
+done
 
 echo Select Cloud Provider:
 echo  1: Amazon Cloud
